@@ -38,7 +38,7 @@ For the missing Genomes, I downloaded them by using this resource: https://www.n
 
 The input dataset containing the relations between Virus and Anti-Viral molecules wasn't well aligned with the
 genome nomenclatures I found in the ViralGenomes DB so by using a genome-browser I managed to curate it.
-The instruction to download the curated file are in the `DataExploration.ipynb` notebook.
+The instruction to download the curated file are in the `DatasetCreation.ipynb` notebook.
 
 ## DeepLearning Seq2Seq Model
 

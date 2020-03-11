@@ -1,0 +1,8 @@
+jupyterlab
+reformer-pytorch
+numpy
+pandas
+tqdm
+sklearn
+cufflinks
+plotly
