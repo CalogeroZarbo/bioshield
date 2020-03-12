@@ -39,13 +39,13 @@ The input dataset containing the relations between Virus and Anti-Viral molecule
 genome nomenclatures I found in the ViralGenomes DB so by using a genome-browser I managed to curate it.
 The instruction to download the curated file are in the `DatasetCreation.ipynb` notebook.
 
-## DeepLearning Seq2Seq Model
+## Seq2Seq Model
 
 The idea behind the model is to use NeuralMachineTranslation model to "translate" the viral genome into the target
 molecule. Since our main target up to now is COVID-19 we need an Encoder-Decoder that can take up to 30k sequence length
 as input. This can be achieved only by using Reformer: The Efficient Transformer. The tentative training of this architecture can be found in the file `train_model_torch.py`
 
-## DeepLearning Transformer model for molecular similarity
+## Transformer model for molecular similarity
 
 The idea is to take inspiration from the Transfomer models capable to achieve good performance in the STS task and put in place a similar model by comparing SMILE configurations of different chemicals.
 TIP: We might use https://github.com/gmum/MAT
