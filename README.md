@@ -1,7 +1,6 @@
-# BioShield
+# BioShield (Work In Progress)
 
-BioShield is a Deep Learning system to predict the Canonical SMILE configuration of a possible anti-viral molecule
-and check if there are in the market FDA approved drugs ready to use.
+BioShield is intented to be an AI system able to predict the Canonical SMILE configuration of a possible anti-viral molecule. Since testing and approving a novel drug takes time, the system will be built with the capability to check if there are in the market drugs, already approved by the FDA, that are as much similar as possibile with the predicted SMILE configuration.
 
 ## Input
 The input has been taken from this article: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6367519/ where a set of anti-viral molecules
@@ -46,9 +45,16 @@ The idea behind the model is to use NeuralMachineTranslation model to "translate
 molecule. Since our main target up to now is COVID-19 we need an Encoder-Decoder that can take up to 30k sequence length
 as input. This can be achieved only by using Reformer: The Efficient Transformer. The tentative training of this architecture can be found in the file `train_model_torch.py`
 
+## DeepLearning Transformer model for molecular similarity
+
+The idea is to take inspiration from the Transfomer models capable to achieve good performance in the STS task and put in place a similar model by comparing SMILE configurations of different chemicals.
+TIP: We might use https://github.com/gmum/MAT
+
+
 ## ToDO
 
-- Reformer EnoderDecoderModel
+- Reformer Seq2Seq model for NMT
+- SMILE Similarity Model for molecular similarity
 
 ## Credits
 
