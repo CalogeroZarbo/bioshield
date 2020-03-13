@@ -45,6 +45,30 @@ The idea behind the model is to use NeuralMachineTranslation model to "translate
 molecule. Since our main target up to now is COVID-19 we need an Encoder-Decoder that can take up to 30k sequence length
 as input. This can be achieved only by using Reformer: The Efficient Transformer. The tentative training of this architecture can be found in the file `train_model_torch.py`
 
+### Training the model
+
+After executing the first part of `DataCreation.ipynb` you would have the file `gen_to_mol_tr.csv` and `gen_to_mol_ts.csv` in the root of the project.
+The model is being training using `DeepSpeed` on a workstation with the following specs:
+- 8 vCPU
+- 30GB RAM
+- 2xP100 16GB RAM
+
+The configurations can be found in `ds_config.json` . The trained model has 24 layers in total, 12 for the Encoder and 12 for the Decoder. The hidden layers dimension is 768 neurons, and take advantage of some tricks found in the Reformer Pytorch implementation like `Axial Embeddings` that works well with long sequences, and in order to reduce the memory impact `weight_tie` has been setted to `true` both for the layers weights as well as for the embeddings ones.
+For the same memory reason, the `ff_chunks` and the `attn_chunks` options has been used in order to feed in chunks the data in the model.
+
+The optimizer chosen was the Over9000 implementation of `RangersLars` (more infor at https://github.com/mgrankin/over9000). Currently the activation function used is the default one, which is GLUE, but in the next training I will use `MISH` (more infor at https://github.com/digantamisra98/Mish).
+
+This first training has been performed using only the first 50000 samples of the dataset. Full training will be performed on a much more powerful machine with 4x or 8x V100. Since in this initial try we have only 2 GPUs I choose 4 samples for each batch in order to parallelize them in 2 per GPU.
+
+The testing process has been performed for 100 samples, in this initial tryout setup, every 100 training steps. In the final run the testing will be performed on the whole dataset. This training has the purpose to understand if the setup works from an architectural point of view, and if the results could start to make sense.
+
+In order to run the training run the following command:
+- `deepspeed train_model_torch.py --dim 768 --bucket_size 64 --depth 12 --deepspeed --deepspeed_config ds_config.json --num_examples_tr 50000 --num_examples_ts 100 --ff_chunks 200 --attn_chunks 8 --validate_every 100 --save_every 100`
+
+### Validating the model
+
+To test the model I would need also the Molecular Similarity model, in order to check which one are the most similar molecules in the dataset that shown good anti-viral properties. Also I will perform some analysis on how much different is the predicted drug with respect to the ones in the validation set. The validation procedure would be done computing the distance between the generated molecule and the ones that have good anti-viral capabilities. 
+
 ## DeepLearning Transformer model for molecular similarity
 
 The idea is to take inspiration from the Transfomer models capable to achieve good performance in the STS task and put in place a similar model by comparing SMILE configurations of different chemicals.
@@ -55,6 +79,10 @@ TIP: We might use https://github.com/gmum/MAT
 
 - Reformer Seq2Seq model for NMT
 - SMILE Similarity Model for molecular similarity
+
+## Disclamier
+
+This is a work in progress, I'll surely do some mistakes or miss something. I'm sharing all my progress in real time in order to enable anyone who want to help starting from the very last update. Please let me know any issues you find in the processes, the ideas and/or the code I wrote. Contribute if you want. The main goal of this repo is trying to help during this Covid-19 pandemy. 
 
 ## Credits
 
