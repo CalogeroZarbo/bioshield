@@ -60,7 +60,7 @@ def preprocess_sentence(code, max_len):
         seq.append("PAD")
     return " ".join(seq)
 
-def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts,max_len_genome,max_len_molecule,reverse=False):
+def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts,max_len_genome,min_len_genome,max_len_molecule,reverse=False):
     print("Reading lines...")
     lang1 = "Genome Virus"
     lang2 = "Molecule SMILES"
@@ -79,6 +79,10 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
                     break
             gen_code = row[1]#['genetic_code']
             can_sml = row[3]#['canonical_smiles']
+
+            if min_len_genome > 0:
+                if len(gen_code) < min_len_genome:
+                    continue
 
             if max_len_genome > 0:
                 if len(gen_code) < max_len_genome:
@@ -205,6 +209,7 @@ def add_argument():
     parser.add_argument('--path_to_file_tr', default='./gen_to_mol_tr.csv', help='Trainig file') 
     parser.add_argument('--path_to_file_ts', default='./gen_to_mol_ts.csv', help='Testing file') 
     parser.add_argument('--max_len_gen', type=int, default=32768, help='Max nucleotides per genome') 
+    parser.add_argument('--min_len_gen', type=int, default=-1, help='Max nucleotides per genome') 
     parser.add_argument('--max_len_mol', type=int, default=2048, help='Max symbols for Canonical SMILES') 
     parser.add_argument('--num_examples_tr', type=int, default=1024, help='Max number of samples TR') 
     parser.add_argument('--num_examples_ts', type=int, default=1024, help='Max number of samples TS') 
@@ -222,6 +227,7 @@ def main():
     path_to_file_tr = cmd_args.path_to_file_tr
     path_to_file_ts =  cmd_args.path_to_file_ts
     max_len_gen = cmd_args.max_len_gen
+    min_len_gen = cmd_args.min_len_gen
     max_len_mol = cmd_args.max_len_mol
     num_examples_tr = cmd_args.num_examples_tr
     num_examples_ts = cmd_args.num_examples_ts
@@ -239,6 +245,7 @@ def main():
     save_every = cmd_args.save_every
 
     MAX_LENGTH_GEN = max_len_gen # 32768
+    MIN_LENGTH_GEN = min_len_gen
     MAX_LENGTH_MOL = max_len_mol # 2048
     NUM_EXAMPLES_TR = num_examples_tr # 1024
     NUM_EXAMPLES_TS = num_examples_ts # 1024
@@ -252,7 +259,7 @@ def main():
 
     input_lang, target_lang, tr_pairs, ts_pairs = readGenomes(genome_file_tr=path_to_file_tr, genome_file_ts=path_to_file_ts, 
                                                 num_examples_tr=NUM_EXAMPLES_TR, num_examples_ts=NUM_EXAMPLES_TS,
-                                                max_len_genome=MAX_LENGTH_GEN, max_len_molecule=MAX_LENGTH_MOL)
+                                                max_len_genome=MAX_LENGTH_GEN, min_len_genome = MIN_LENGTH_GEN,max_len_molecule=MAX_LENGTH_MOL)
 
     class GenomeToMolDataset(Dataset):
         def __init__(self, data, src_lang, trg_lang):
