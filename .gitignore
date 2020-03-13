@@ -4,3 +4,5 @@ __pycache__
 *.pyc
 *.fasta
 .vscode
+saved_model/
+*.pt
