@@ -18,6 +18,8 @@ from apex import amp
 import deepspeed
 from torch.utils.data import DataLoader, Dataset
 import argparse
+import datetime
+import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
@@ -30,7 +32,7 @@ class Lang:
         self.name = name
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {0: "PAD", 1: "SOS", 2: "EOS"}
+        self.index2word = {PAD_IDX: "PAD", SOS_token: "SOS", EOS_token: "EOS"}
         self.n_words = 3  # Count PAD, SOS and EOS
         self.max_len = 0
 
@@ -160,22 +162,8 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
 
     return input_lang, output_lang, tr_pairs, ts_pairs
 
-# test load functions
 def indexesFromSentence(lang, sentence):
     return [lang.word2index[word] for word in sentence.split(' ')]
-
-
-def tensorFromSentence(lang, sentence):
-    indexes = indexesFromSentence(lang, sentence)
-    #indexes.append(EOS_token)
-    return torch.tensor(indexes, dtype=torch.long, device=device).view(-1, 1)
-
-
-def tensorsFromPair(pair):
-    input_tensor = tensorFromSentence(input_lang, pair[0])
-    target_tensor = tensorFromSentence(output_lang, pair[1])
-    return (input_tensor, target_tensor)
-
 
 def showPlot(points):
     plt.figure()
@@ -192,9 +180,7 @@ def add_argument():
                         help='use CPU in case there\'s no GPU support')
     parser.add_argument('--use_ema', default=False, action='store_true',
                         help='whether use exponential moving average')
-    #parser.add_argument('-b', '--batch_size', default=32, type=int,
-    #                    help='mini-batch size (default: 32)')
-    parser.add_argument('-e', '--epochs', default=30, type=int,
+    parser.add_argument('-e', '--epochs', default=10, type=int,
                         help='number of total epochs (default: 30)')
     parser.add_argument('--local_rank', type=int, default=-1,
                         help='local rank passed from distributed launcher')
@@ -239,7 +225,6 @@ def main():
     max_len_mol = cmd_args.max_len_mol
     num_examples_tr = cmd_args.num_examples_tr
     num_examples_ts = cmd_args.num_examples_ts
-    #batch_size = cmd_args.batch_size
     train_batch_size = cmd_args.train_batch_size
     epochs = cmd_args.epochs
     emb_dim = cmd_args.emb_dim
@@ -257,7 +242,6 @@ def main():
     MAX_LENGTH_MOL = max_len_mol # 2048
     NUM_EXAMPLES_TR = num_examples_tr # 1024
     NUM_EXAMPLES_TS = num_examples_ts # 1024
-    #BATCH_SIZE = batch_size # 32
     N_EPOCHS = epochs # 10
     VALIDATE_EVERY = validate_every
     SAVE_EVERY = save_every
@@ -278,14 +262,9 @@ def main():
             self.trg_lang = trg_lang
 
         def __getitem__(self, index):
-            #print(index)
             pair = self.data[index]
-            #print('src:',pair[0])
-            #print('\n\ntrg:',pair[1])
             src = torch.tensor(indexesFromSentence(self.src_lang,pair[0]), dtype=torch.long)
             trg = torch.tensor(indexesFromSentence(self.trg_lang,pair[1]), dtype=torch.long)
-            # print('src:', src)
-            # print('trg:', trg)
             return src,trg
 
         def __len__(self):
@@ -296,7 +275,6 @@ def main():
 
     encoder = ReformerLM(
         num_tokens = input_lang.n_words,
-        # emb_dim = emb_dim,#128,
         dim = dim,#512,
         bucket_size = bucket_size, # 16,
         depth = depth, # 6,
@@ -306,16 +284,15 @@ def main():
         ff_chunks = ff_chunks, #400,      # number of chunks for feedforward layer, make higher if there are memory issues
         attn_chunks = attn_chunks, #16,    # process lsh attention in chunks, only way for memory to fit when scaling to 16k tokens
         weight_tie = True,
+        weight_tie_embedding = True,
         axial_position_emb = True,
         axial_position_shape = (256, 128),  # the shape must multiply up to the max_seq_len (256 x 128 = 32768)
         axial_position_dims = (int(dim/2), int(dim/2)),  # the dims must sum up to the model dimensions (512 + 512 = 1024)
-        #fixed_position_emb = True,
         return_embeddings = True # return output of last attention layer
     ).cuda()
 
     decoder = ReformerLM(
         num_tokens = target_lang.n_words,
-        # emb_dim = emb_dim, # 128,
         dim = dim, # 512,
         bucket_size = bucket_size, #16,
         depth = depth, #6,
@@ -327,17 +304,16 @@ def main():
         axial_position_emb = True,
         axial_position_shape = (64, 32),  # the shape must multiply up to the max_seq_len (64 x 32 = 2048)
         axial_position_dims = (int(dim/2), int(dim/2)),  # the dims must sum up to the model dimensions (512 + 512 = 1024)
-        #fixed_position_emb = True,
-        weight_tie = False,
+        weight_tie = True,
+        weight_tie_embedding = True,
         causal = True
     ).cuda()
 
-    encoder_optimizer = RangerLars(encoder.parameters()) # torch.optim.Adam(encoder.parameters(), lr=learning_rate)
-    decoder_optimizer = RangerLars(decoder.parameters()) # torch.optim.Adam(decoder.parameters(), lr=learning_rate)
+    encoder_optimizer = RangerLars(encoder.parameters()) 
+    decoder_optimizer = RangerLars(decoder.parameters()) 
 
-    encoder = TrainingWrapper(encoder).cuda()
-
-    decoder = TrainingWrapper(decoder).cuda()
+    encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX).cuda()
+    decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX).cuda()
 
     encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
     decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
@@ -348,63 +324,76 @@ def main():
     # training
     SAVE_DIR = './saved_model/'
 
-    _, encoder_client_sd = encoder_engine.load_checkpoint(SAVE_DIR+'encoder/', None)
-    _, decoder_client_sd = decoder_engine.load_checkpoint(SAVE_DIR+'decoder/', None) #args.ckpt_id 
+    try:
+        enc_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'encoder/')])
+    except Exception as e:
+        print('Exception:', e)
+        enc_ckp_max = 0
+    
+    try:
+        dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'decoder/')])
+    except:
+        dec_ckp_max = 0
+
+    _, encoder_client_sd = encoder_engine.load_checkpoint(SAVE_DIR+'encoder/', enc_ckp_max)
+    _, decoder_client_sd = decoder_engine.load_checkpoint(SAVE_DIR+'decoder/', dec_ckp_max) #args.ckpt_id 
 
     gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
     print('gpus_mini_batch:', gpus_mini_batch)
-    for i, pair in enumerate(trainloader):
-        src = pair[0]
-        trg = pair[1]
-        encoder_engine.train()
-        decoder_engine.train()
-        src = src.to(encoder_engine.local_rank)
-        trg = trg.to(decoder_engine.local_rank)
-        
-        # print(src.shape)
-        # print(src.dtype)
-        # print(trg.shape)
-        # print(trg.dtype)
+    log_file = open('./training_log.log', 'a')
+    log_file.write("\n\n\n{}\tStarting new training from chekpoint: Encoder-{} | Decoder-{}\n".format(datetime.datetime.now(), enc_ckp_max, dec_ckp_max))
+    log_file.flush()
+    for eph in range(epochs):
+        print('Starting Epoch: {}'.format(eph))
+        for i, pair in enumerate(trainloader):
+            tr_step = ((eph*len(trainloader))+i)+1
 
-        enc_keys = encoder_engine(src)
-        loss = decoder_engine(trg, keys = enc_keys, return_loss = True)   # (1, 4096, 20000)
-        loss.backward()
-        #decoder_engine.backward(loss, retain_variables=True)
-        #encoder_engine.backward(loss)
-        decoder_engine.step()
-        encoder_engine.step()
-        
-        print('Training Loss:',loss.item())       
+            src = pair[0]
+            trg = pair[1]
+            encoder_engine.train()
+            decoder_engine.train()
+            src = src.to(encoder_engine.local_rank)
+            trg = trg.to(decoder_engine.local_rank)
 
-        if i % VALIDATE_EVERY == 0:
-            val_loss = []
-            #mini_batch = []
-            for pair in tqdm(test_dataset):
-                #if (j+1) % gpus_mini_batch:
-                encoder.eval()
-                decoder.eval()
-                with torch.no_grad():
-                    #ts_src,ts_trg = pair[0], pair[1]
-                    ts_src = torch.tensor(np.array([pair[0].numpy()])).cuda()
-                    ts_trg = torch.tensor(np.array([pair[1].numpy()])).cuda()
-                    enc_keys = encoder(ts_src)
-                    loss = decoder(ts_trg, keys=enc_keys, return_loss = True)
-                    val_loss.append(loss.item())
-                    #mini_batch = []
-                #else:
-                #    mini_batch.append(pair)
-            print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
+            enc_keys = encoder_engine(src)
+            loss = decoder_engine(trg, keys = enc_keys, return_loss = True)   # (1, 4096, 20000)
+            loss.backward()
 
-        if i % SAVE_EVERY == 0:
-            print('Saving...')
-            if encoder_client_sd:
-                encoder_client_sd['step'] = i
-            if decoder_client_sd:
-                decoder_client_sd['step'] = i
-            print('\tSaving Checkpoint')
-            ckpt_id = f'tr_{loss.item()}-val_{np.mean(val_loss)}'
-            encoder_engine.save_checkpoint(SAVE_DIR+'encoder/', ckpt_id)# client_sd = encoder_client_sd)
-            decoder_engine.save_checkpoint(SAVE_DIR+'decoder/', ckpt_id)# client_sd = decoder_client_sd)
+            decoder_engine.step()
+            encoder_engine.step()
+            
+            print('Training Loss:',loss.item())       
+            if tr_step % VALIDATE_EVERY == 0:
+                val_loss = []
+                for pair in tqdm(test_dataset):
+                    encoder.eval()
+                    decoder.eval()
+                    with torch.no_grad():
+                        ts_src = torch.tensor(np.array([pair[0].numpy()])).cuda()
+                        ts_trg = torch.tensor(np.array([pair[1].numpy()])).cuda()
+                        enc_keys = encoder(ts_src)
+                        loss = decoder(ts_trg, keys=enc_keys, return_loss = True)
+                        val_loss.append(loss.item())
+
+                print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
+                log_file.write('Step: {}\tTraining Loss:{}\t Validation LOSS: AVG: {}| MEDIAN: {}| STD: {}\n'.format(
+                                                                                                i,
+                                                                                                loss.item(),
+                                                                                                np.mean(val_loss),
+                                                                                                np.median(val_loss),
+                                                                                                np.std(val_loss)))
+            else:
+                log_file.write('Step: {}\tTraining Loss:{}\n'.format(i,loss.item()))
+            
+            log_file.flush()
+
+            if tr_step % SAVE_EVERY == 0:
+                print('\tSaving Checkpoint')
+                enc_ckpt_id = str(enc_ckp_max+tr_step+1) 
+                dec_ckpt_id = str(dec_ckp_max+tr_step+1)
+                encoder_engine.save_checkpoint(SAVE_DIR+'encoder/', enc_ckpt_id)
+                decoder_engine.save_checkpoint(SAVE_DIR+'decoder/', dec_ckpt_id)
+        log_file.close()
 
 if __name__ == '__main__':
     main()
