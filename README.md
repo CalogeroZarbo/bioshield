@@ -78,6 +78,7 @@ TIP: We might use https://github.com/gmum/MAT
 ## ToDO
 
 - Reformer Seq2Seq model for NMT
+  - Implement Parallel Testing for the Seq2Seq model
 - SMILE Similarity Model for molecular similarity
 
 ## Disclamier
