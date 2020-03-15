@@ -292,7 +292,10 @@ def main():
                 enc_dec_ckpt_id = str(enc_dec_ckp_max+tr_step+1)
                 enc_dec_engine.save_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckpt_id)
                 
-        log_file.close()
+    log_file.close()
+    print('\tSaving Final Checkpoint')
+    enc_dec_ckpt_id = str(enc_dec_ckp_max+tr_step+1)
+    enc_dec_engine.save_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckpt_id)
 
 if __name__ == '__main__':
     main()
