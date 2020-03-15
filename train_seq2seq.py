@@ -152,14 +152,17 @@ def main():
         enc_num_tokens = input_lang.n_words,
         enc_max_seq_len = VIR_SEQ_LEN,
         enc_depth = depth, # 6,
+        enc_bucket_size = bucket_size, # 16,
         return_embeddings = True,
 
         dec_num_tokens = target_lang.n_words,
-        dec_depth = depth,
         dec_max_seq_len = MOL_SEQ_LEN,
+        dec_depth = depth,
+        dec_bucket_size = bucket_size,
         dec_causal = True,
         
-        bucket_size = bucket_size, # 16,
+        ignore_index = PAD_IDX,
+        pad_value = PAD_IDX,        
         heads = heads, # 8,
         n_hashes= n_hashes,
         ff_chunks = ff_chunks, #400,      # number of chunks for feedforward layer, make higher if there are memory issues
@@ -235,9 +238,10 @@ def main():
             trg = trg.to(enc_dec_engine.local_rank)
 
             enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in src]).bool().to(device)
-            context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in trg]).bool().to(device)
+            #context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in trg]).bool().to(device)
+            #enc_input_mask = torch.ones(1, VIR_SEQ_LEN).bool().to(device)
 
-            loss = enc_dec(src, trg, return_loss = True, enc_input_mask = enc_input_mask, context_mask=context_mask)
+            loss = enc_dec(src, trg, return_loss = True, enc_input_mask = enc_input_mask)#, context_mask=context_mask)
 
             loss.backward()
 
@@ -256,9 +260,10 @@ def main():
                         ts_trg = ts_trg.to(enc_dec_engine.local_rank)
 
                         ts_enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_src]).bool().to(device)
-                        ts_context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_trg]).bool().to(device)
+                        #ts_context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_trg]).bool().to(device)
+                        #ts_enc_input_mask = torch.ones(1, VIR_SEQ_LEN).bool().to(device)
 
-                        loss = enc_dec(ts_src, ts_trg, return_loss = True, enc_input_mask = ts_enc_input_mask, context_mask=ts_context_mask)
+                        loss = enc_dec(ts_src, ts_trg, return_loss = True, enc_input_mask = ts_enc_input_mask)#, context_mask=ts_context_mask)
                         val_loss.append(loss.item())
 
                 print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
