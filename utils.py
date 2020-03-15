@@ -2,6 +2,7 @@ import torch
 import csv
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
+import pickle
 
 PAD_IDX = 0
 SOS_token = 1
@@ -40,7 +41,7 @@ def preprocess_sentence(code, max_len):
         seq.append("PAD")
     return " ".join(seq)
 
-def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts,max_len_genome,min_len_genome,max_len_molecule,reverse=False):
+def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts,max_len_genome,min_len_genome,max_len_molecule,reverse=False, saved_input_lang=None, saved_target_lang=None):
     print("Reading lines...")
     lang1 = "Genome Virus"
     lang2 = "Molecule SMILES"
@@ -129,13 +130,18 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
             mol.append("PAD")
         ts_pairs[i][1] = ' '.join(mol)
 
-    for pair in tr_pairs:
-        input_lang.addSentence(pair[0])
-        output_lang.addSentence(pair[1])
+    if not saved_input_lang or not saved_target_lang:
+        for pair in tr_pairs:
+            input_lang.addSentence(pair[0])
+            output_lang.addSentence(pair[1])
 
-    for pair in ts_pairs:
-        input_lang.addSentence(pair[0])
-        output_lang.addSentence(pair[1])
+        for pair in ts_pairs:
+            input_lang.addSentence(pair[0])
+            output_lang.addSentence(pair[1])
+    else:
+        input_lang = pickle.load(open(saved_input_lang, 'rb'))
+        target_lang = pickle.load(open(saved_target_lang, 'rb'))
+
     print("Counted words:")
     print(input_lang.name, input_lang.n_words)
     print(output_lang.name, output_lang.n_words)
