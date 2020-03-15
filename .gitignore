@@ -7,3 +7,5 @@ __pycache__
 saved_model/
 *.pt
 *.pkl
+*.zip
+.DS_Store
