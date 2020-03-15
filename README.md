@@ -43,7 +43,7 @@ The instruction to download the curated file are in the `DatasetCreation.ipynb` 
 
 The idea behind the model is to use NeuralMachineTranslation model to "translate" the viral genome into the target
 molecule. Since our main target up to now is COVID-19 we need an Encoder-Decoder that can take up to 30k sequence length
-as input. This can be achieved only by using Reformer: The Efficient Transformer. The tentative training of this architecture can be found in the file `train_model_torch.py`
+as input. This can be achieved only by using Reformer: The Efficient Transformer. The tentative training of this architecture can be found in the file `train_seq2seq.py`
 
 ### Training the model
 
@@ -56,14 +56,14 @@ The model is being training using `DeepSpeed` on a workstation with the followin
 The configurations can be found in `ds_config.json` . The trained model has 24 layers in total, 12 for the Encoder and 12 for the Decoder. The hidden layers dimension is 768 neurons, and take advantage of some tricks found in the Reformer Pytorch implementation like `Axial Embeddings` that works well with long sequences, and in order to reduce the memory impact `weight_tie` has been setted to `true` both for the layers weights as well as for the embeddings ones.
 For the same memory reason, the `ff_chunks` and the `attn_chunks` options has been used in order to feed in chunks the data in the model.
 
-The optimizer chosen was the Over9000 implementation of `RangersLars` (more infor at https://github.com/mgrankin/over9000). Currently the activation function used is the default one, which is GLUE, but in the next training I will use `MISH` (more infor at https://github.com/digantamisra98/Mish).
+The optimizer chosen was the Over9000 implementation of `RangersLars` (more info at https://github.com/mgrankin/over9000). Currently the activation function used is the default one, which is `GLUE`, but in the next training I will use `MISH` (more info at https://github.com/digantamisra98/Mish).
 
 This first training has been performed using only the first 50000 samples of the dataset. Full training will be performed on a much more powerful machine with 4x or 8x V100. Since in this initial try we have only 2 GPUs I choose 4 samples for each batch in order to parallelize them in 2 per GPU.
 
 The testing process has been performed for 100 samples, in this initial tryout setup, every 100 training steps. In the final run the testing will be performed on the whole dataset. This training has the purpose to understand if the setup works from an architectural point of view, and if the results could start to make sense.
 
 In order to run the training run the following command:
-- `deepspeed train_model_torch.py --dim 768 --bucket_size 64 --depth 12 --deepspeed --deepspeed_config ds_config.json --num_examples_tr 50000 --num_examples_ts 100 --ff_chunks 200 --attn_chunks 8 --validate_every 100 --save_every 100`
+- `deepspeed train_seq2seq.py --dim 768 --bucket_size 64 --depth 12 --deepspeed --deepspeed_config ds_config.json --num_examples_tr 50000 --num_examples_ts 100 --ff_chunks 200 --attn_chunks 8 --validate_every 100 --save_every 100`
 
 ### Validating the model
 
