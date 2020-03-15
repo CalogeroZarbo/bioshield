@@ -39,6 +39,12 @@ The input dataset containing the relations between Virus and Anti-Viral molecule
 genome nomenclatures I found in the ViralGenomes DB so by using a genome-browser I managed to curate it.
 The instruction to download the curated file are in the `DatasetCreation.ipynb` notebook.
 
+Premade Genome to SMILE files can be found here:
+- Training:
+- Testing: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol_ts.csv
+- Validation: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol_val.csv
+- Complete Dataset: 
+
 ## Reformer Model Enc-Dec for Seq2Seq Model
 
 The idea behind the model is to use NeuralMachineTranslation model to "translate" the viral genome into the target
@@ -65,6 +71,9 @@ The testing process has been performed for 100 samples, in this initial tryout s
 In order to run the training run the following command:
 - `deepspeed train_seq2seq.py --dim 768 --bucket_size 64 --depth 12 --deepspeed --deepspeed_config ds_config.json --num_examples_tr 50000 --num_examples_ts 100 --ff_chunks 200 --attn_chunks 8 --validate_every 100 --save_every 100`
 
+The first 50K trained EncoderDecoder model can be found here:
+- https://storage.googleapis.com/bioshield-bucket/bioshield/first_50k_train.zip
+
 ### Validating the model
 
 To test the model I would need also the Molecular Similarity model, in order to check which one are the most similar molecules in the dataset that shown good anti-viral properties. Also I will perform some analysis on how much different is the predicted drug with respect to the ones in the validation set. The validation procedure would be done computing the distance between the generated molecule and the ones that have good anti-viral capabilities. 
@@ -79,6 +88,9 @@ TIP: We might use https://github.com/gmum/MAT
 
 - Reformer Seq2Seq model for NMT
   - Implement Parallel Testing for the Seq2Seq model
+  - Implement MISH option
+    - Add MISH and MISH Cuda to automatically switch according device
+  - Implement DeepSpeed evaluation script that actually generates Canonical SMILES
 - SMILE Similarity Model for molecular similarity
 
 ## Disclamier
