@@ -1,11 +1,12 @@
 import torch
 from reformer_pytorch import ReformerLM
-from reformer_pytorch.generative_tools import TrainingWrapper
+from reformer_pytorch.generative_tools import TrainingWrapper, top_p
 from over9000 import RangerLars
 import os
 import numpy as np
 from utils import readGenomes, GenomeToMolDataset
 from tqdm import tqdm
+import pickle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
@@ -21,12 +22,6 @@ def convert_ds_chkpt(ds_chkpt, device):
         torch_state_dic[k] = v 
     return torch_state_dic
 
-input_lang, target_lang, tr_pairs, ts_pairs = readGenomes(genome_file_tr='./gen_to_mol_tr.csv', genome_file_ts='./gen_to_mol_ts.csv', 
-                                                num_examples_tr=100, num_examples_ts=10,
-                                                max_len_genome=32768, min_len_genome = -1,max_len_molecule=2048)
-
-train_dataset = GenomeToMolDataset(tr_pairs, input_lang, target_lang)
-test_dataset = GenomeToMolDataset(ts_pairs, input_lang, target_lang)
 
 encoder_checkpoint = './saved_model/encoder/201/mp_rank_00_model_states.pt'
 decoder_checkpoint = './saved_model/decoder/201/mp_rank_00_model_states.pt'
@@ -40,6 +35,19 @@ VIR_SEQ_LEN = 32768
 ff_chunks = 200
 attn_chunks = 8
 MOL_SEQ_LEN = 2048
+
+output_folder = './training_output/'
+
+input_lang, target_lang, tr_pairs, ts_pairs = readGenomes(genome_file_tr='./gen_to_mol_tr.csv', genome_file_ts='./gen_to_mol_ts.csv', 
+                                                saved_input_lang='./vir_lang.pkl', saved_target_lang='./mol_lang.pkl',
+                                                num_examples_tr=50000, num_examples_ts=100,
+                                                max_len_genome=VIR_SEQ_LEN, min_len_genome = -1,max_len_molecule=MOL_SEQ_LEN)
+
+pickle.dump(input_lang, open('vir_lang.pkl', 'wb'))
+pickle.dump(target_lang, open('mol_lang.pkl', 'wb'))
+
+train_dataset = GenomeToMolDataset(tr_pairs, input_lang, target_lang)
+test_dataset = GenomeToMolDataset(ts_pairs, input_lang, target_lang)
 
 encoder = ReformerLM(
     num_tokens = 11,#input_lang.n_words,
@@ -57,7 +65,7 @@ encoder = ReformerLM(
     axial_position_shape = (256, 128),  # the shape must multiply up to the max_seq_len (256 x 128 = 32768)
     axial_position_dims = (int(dim/2), int(dim/2)),  # the dims must sum up to the model dimensions (512 + 512 = 1024)
     return_embeddings = True # return output of last attention layer
-)#.cuda()
+).to(device)
 
 decoder = ReformerLM(
     num_tokens = 51,#target_lang.n_words,
@@ -75,7 +83,7 @@ decoder = ReformerLM(
     weight_tie = True,
     weight_tie_embedding = True,
     causal = True
-)#.cuda()
+).to(device)
 
 
 #encoder_optimizer = RangerLars(encoder.parameters()) 
@@ -96,6 +104,26 @@ dec_params_size = sum([np.prod(p.size()) for p in decoder.parameters()])
 print('Total parameters:', enc_params_size+dec_params_size)
 print('Total trainable parameters:', enc_params_size_trainable+dec_params_size_trainable)
 
+# for pair in tqdm(test_dataset):
+#     encoder.eval()
+#     decoder.eval()
+#     with torch.no_grad():
+#         ts_src = torch.tensor(np.array([pair[0].numpy()])).to(device)
+#         ts_trg = torch.tensor(np.array([pair[1].numpy()])).to(device)
+#         enc_keys = encoder(ts_src)
+#         yi = torch.tensor([[SOS_token]]).long().to(device) # assume you are sampling batch size of 2, start tokens are id of 0
+#         sample = decoder.generate(yi, MOL_SEQ_LEN, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token) # (2, <= 1024)
+#         actual_mol = ''
+#         for mol_seq in sample.cpu().numpy():
+#             for mol_idx in mol_seq:
+#                 actual_mol += target_lang.index2word[mol_idx]
+#             print('Generated Seq:', sample)
+#             print('Generated Mol:', actual_mol)
+#             print('Real Mol:', [target_lang.index2word[mol_idx] for mol_idx in pair[1]])
+
+
+
+
 val_loss = []
 
 for pair in tqdm(test_dataset):
@@ -107,11 +135,18 @@ for pair in tqdm(test_dataset):
         enc_keys = encoder(ts_src)
         loss = decoder(ts_trg, keys=enc_keys, return_loss = True)
         val_loss.append(loss.item())
-        print('Loss:', loss)
+        print('Loss:', loss.item())
 
 print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
 
 
+## ENC DEC Evaluation
+## evaluate with the following
+
+# eval_seq_in = torch.randint(0, 20000, (1, DE_SEQ_LEN)).long().cuda()
+# eval_seq_out_start = torch.tensor([[0.]]).long().cuda() # assume 0 is id of start token
+# samples = enc_dec.generate(eval_seq_in, eval_seq_out_start, seq_len = EN_SEQ_LEN, eos_token = 1) # assume 1 is id of stop token
+# print(samples.shape) # (1, <= 1024) decode the tokens
 
 # encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
 # decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
