@@ -18,6 +18,7 @@ import argparse
 import datetime
 import os
 from utils import *
+import pickle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
@@ -50,6 +51,9 @@ def add_argument():
                         help='Frequency of validation') # 12
     parser.add_argument('--save_every', type=int, default=10,
                         help='Frequency of saving checkpoint') # 12
+    
+    parser.add_argument('--output_folder', type=str, default='./training_output',
+                        help='Output folder where to store the training output') # 12
 
     parser.add_argument('--path_to_file_tr', default='./gen_to_mol_tr.csv', help='Trainig file') 
     parser.add_argument('--path_to_file_ts', default='./gen_to_mol_ts.csv', help='Testing file') 
@@ -88,6 +92,7 @@ def main():
     attn_chunks = cmd_args.attn_chunks
     validate_every = cmd_args.validate_every
     save_every = cmd_args.save_every
+    output_folder = cmd_args.output_folder
 
     MAX_LENGTH_GEN = max_len_gen # 32768
     MIN_LENGTH_GEN = min_len_gen
@@ -106,6 +111,9 @@ def main():
                                                 num_examples_tr=NUM_EXAMPLES_TR, num_examples_ts=NUM_EXAMPLES_TS,
                                                 max_len_genome=MAX_LENGTH_GEN, min_len_genome = MIN_LENGTH_GEN,max_len_molecule=MAX_LENGTH_MOL)
     
+    pickle.dump(input_lang, open(os.sep.join([output_folder, 'vir_lang.pkl']), 'wb'))
+    pickle.dump(target_lang, open(os.sep.join([output_folder, 'mol_lang.pkl']), 'wb'))
+
     train_dataset = GenomeToMolDataset(tr_pairs, input_lang, target_lang)
     test_dataset = GenomeToMolDataset(ts_pairs, input_lang, target_lang)
 
@@ -148,6 +156,7 @@ def main():
 
     enc_dec = ReformerEncDec(
         dim = dim,#512,
+        bucket_size = bucket_size,
 
         enc_num_tokens = input_lang.n_words,
         enc_max_seq_len = VIR_SEQ_LEN,
@@ -194,7 +203,7 @@ def main():
    
 
     # training
-    SAVE_DIR = './saved_model/'
+    SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
 
     # try:
     #     enc_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'encoder/')])
@@ -208,18 +217,18 @@ def main():
     #     dec_ckp_max = 0
 
     try:
-        enc_dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'enc_dec/')])
+        enc_dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'enc_dec']))])
     except:
         enc_dec_ckp_max = 0
 
     # _, encoder_client_sd = encoder_engine.load_checkpoint(SAVE_DIR+'encoder/', enc_ckp_max)
     # _, decoder_client_sd = decoder_engine.load_checkpoint(SAVE_DIR+'decoder/', dec_ckp_max) 
 
-    _, enc_dec_client_sd = enc_dec_engine.load_checkpoint(SAVE_DIR+'enc_dec/', enc_dec_ckp_max) 
+    _, enc_dec_client_sd = enc_dec_engine.load_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckp_max) 
 
     gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
     print('gpus_mini_batch:', gpus_mini_batch)
-    log_file = open('./training_log.log', 'a')
+    log_file = open(os.sep.join([output_folder,'training_log.log']), 'a')
     # log_file.write("\n\n\n{}\tStarting new training from chekpoint: Encoder-{} | Decoder-{}\n".format(datetime.datetime.now(), enc_ckp_max, dec_ckp_max))
     log_file.write("\n\n\n{}\tStarting new training from chekpoint: EncoderDecoder-{}\n".format(datetime.datetime.now(), enc_dec_ckp_max))
     log_file.flush()
@@ -237,11 +246,11 @@ def main():
             src = src.to(enc_dec_engine.local_rank)
             trg = trg.to(enc_dec_engine.local_rank)
 
-            enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in src]).bool().to(device)
+            #enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in src]).bool().to(device)
             #context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in trg]).bool().to(device)
             #enc_input_mask = torch.ones(1, VIR_SEQ_LEN).bool().to(device)
 
-            loss = enc_dec(src, trg, return_loss = True, enc_input_mask = enc_input_mask)#, context_mask=context_mask)
+            loss = enc_dec(src, trg, return_loss = True, enc_input_mask = None)#enc_input_mask)#, context_mask=context_mask)
 
             loss.backward()
 
@@ -259,11 +268,11 @@ def main():
                         ts_src= ts_src.to(enc_dec_engine.local_rank)
                         ts_trg = ts_trg.to(enc_dec_engine.local_rank)
 
-                        ts_enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_src]).bool().to(device)
+                        #ts_enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_src]).bool().to(device)
                         #ts_context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_trg]).bool().to(device)
                         #ts_enc_input_mask = torch.ones(1, VIR_SEQ_LEN).bool().to(device)
 
-                        loss = enc_dec(ts_src, ts_trg, return_loss = True, enc_input_mask = ts_enc_input_mask)#, context_mask=ts_context_mask)
+                        loss = enc_dec(ts_src, ts_trg, return_loss = True, enc_input_mask = None)#ts_enc_input_mask)#, context_mask=ts_context_mask)
                         val_loss.append(loss.item())
 
                 print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
@@ -281,7 +290,7 @@ def main():
             if tr_step % SAVE_EVERY == 0:
                 print('\tSaving Checkpoint')
                 enc_dec_ckpt_id = str(enc_dec_ckp_max+tr_step+1)
-                enc_dec_engine.save_checkpoint(SAVE_DIR+'enc_dec/', enc_dec_ckpt_id)
+                enc_dec_engine.save_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckpt_id)
                 
         log_file.close()
 
