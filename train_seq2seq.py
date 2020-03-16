@@ -1,5 +1,5 @@
 import torch
-from reformer_pytorch import ReformerEncDec
+from reformer_pytorch import ReformerEncDec, ReformerLM
 from reformer_pytorch.generative_tools import TrainingWrapper
 import torch.optim as optim
 import torch.nn as nn
@@ -22,6 +22,268 @@ import pickle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
+
+def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_hashes, vir_seq_len, ff_chunks, attn_chunks,
+                    mol_seq_len, cmd_args, train_dataset, test_dataset, output_folder, train_batch_size, epochs,
+                    validate_every, save_every):
+    encoder = ReformerLM(
+        num_tokens = input_lang.n_words,
+        dim = dim,
+        bucket_size = bucket_size,
+        depth = depth, 
+        heads = heads, 
+        n_hashes= n_hashes,
+        max_seq_len = vir_seq_len,
+        ff_chunks = ff_chunks, 
+        attn_chunks = attn_chunks, 
+        weight_tie = True,
+        weight_tie_embedding = True,
+        axial_position_emb = True,
+        axial_position_shape = (256, 128),  
+        axial_position_dims = (int(dim/2), int(dim/2)),  
+        return_embeddings = True 
+    ).to(device)
+
+    decoder = ReformerLM(
+        num_tokens = target_lang.n_words,
+        dim = dim, 
+        bucket_size = bucket_size,
+        depth = depth, 
+        heads = heads, 
+        n_hashes= n_hashes,
+        ff_chunks = ff_chunks, 
+        attn_chunks = attn_chunks, 
+        max_seq_len = mol_seq_len,
+        axial_position_emb = True,
+        axial_position_shape = (64, 32),  
+        axial_position_dims = (int(dim/2), int(dim/2)), 
+        weight_tie = True,
+        weight_tie_embedding = True,
+        causal = True
+    ).to(device)
+
+    encoder_optimizer = RangerLars(encoder.parameters()) 
+    decoder_optimizer = RangerLars(decoder.parameters()) 
+    
+
+    encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
+    decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
+    
+
+    encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
+    decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
+
+    encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=encoder, optimizer=encoder_optimizer, model_parameters=encoder_params, training_data=train_dataset, dist_init_required=True)
+    decoder_engine, decoder_optimizer, _, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, model_parameters=encoder_params, dist_init_required=False)
+    
+    _, _, testloader, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, training_data=test_dataset)
+   
+
+    SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
+
+    try:
+        enc_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'encoder']))])
+    except Exception as e:
+        print('Exception:', e)
+        enc_ckp_max = 0
+    
+    try:
+        dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'decoder']))])
+    except:
+        dec_ckp_max = 0
+
+    _, encoder_client_sd = encoder_engine.load_checkpoint(os.sep.join([SAVE_DIR,'encoder']), enc_ckp_max)
+    _, decoder_client_sd = decoder_engine.load_checkpoint(os.sep.join([SAVE_DIR,'decoder']), dec_ckp_max) 
+
+    gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
+    print('gpus_mini_batch:', gpus_mini_batch)
+    log_file = open(os.sep.join([output_folder,'training_log.log']), 'a')
+    log_file.write("\n\n\n{}\tStarting new training from chekpoint: Encoder-{} | Decoder-{}\n".format(datetime.datetime.now(), enc_ckp_max, dec_ckp_max))
+    log_file.flush()
+
+    for eph in range(epochs):
+        print('Starting Epoch: {}'.format(eph))
+        for i, pair in enumerate(trainloader):
+            tr_step = ((eph*len(trainloader))+i)+1
+
+            src = pair[0]
+            trg = pair[1]
+            encoder_engine.train()
+            decoder_engine.train()
+            src = src.to(encoder_engine.local_rank)
+            trg = trg.to(decoder_engine.local_rank)
+
+            enc_keys = encoder_engine(src)
+            loss = decoder_engine(trg, keys = enc_keys, return_loss = True)   # (1, 4096, 20000)
+            loss.backward()
+
+            decoder_engine.step()
+            encoder_engine.step()
+            
+            print('Training Loss:',loss.item())       
+            if tr_step % validate_every == 0:
+                val_loss = []
+                for pair in tqdm(testloader):
+                    encoder_engine.eval()
+                    decoder_engine.eval()
+                    with torch.no_grad():
+                        ts_src = pair[0]
+                        ts_trg = pair[1]
+
+                        ts_src= ts_src.to(encoder_engine.local_rank)
+                        ts_trg = ts_trg.to(decoder_engine.local_rank)
+
+                        enc_keys = encoder_engine(ts_src)
+                        loss = decoder_engine(ts_trg, keys=enc_keys, return_loss = True)
+                        val_loss.append(loss.item())
+
+                print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
+                log_file.write('Step: {}\tTraining Loss:{}\t Validation LOSS: AVG: {}| MEDIAN: {}| STD: {}\n'.format(
+                                                                                                i,
+                                                                                                loss.item(),
+                                                                                                np.mean(val_loss),
+                                                                                                np.median(val_loss),
+                                                                                                np.std(val_loss)))
+            else:
+                log_file.write('Step: {}\tTraining Loss:{}\n'.format(i,loss.item()))
+            
+            log_file.flush()
+
+            if tr_step % save_every == 0:
+                print('\tSaving Checkpoint')
+                enc_ckpt_id = str(enc_ckp_max+tr_step+1) 
+                dec_ckpt_id = str(dec_ckp_max+tr_step+1)
+                encoder_engine.save_checkpoint(os.sep.join([SAVE_DIR,'encoder']), enc_ckpt_id)
+                decoder_engine.save_checkpoint(os.sep.join([SAVE_DIR,'decoder']), dec_ckpt_id)
+                
+    log_file.close()
+    print('\tSaving Final Checkpoint')
+    enc_ckpt_id = str(enc_ckp_max+tr_step+1) 
+    dec_ckpt_id = str(dec_ckp_max+tr_step+1)
+    encoder_engine.save_checkpoint(os.sep.join([SAVE_DIR,'encoder']), enc_ckpt_id)
+    decoder_engine.save_checkpoint(os.sep.join([SAVE_DIR,'decoder']), dec_ckpt_id)
+
+def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, depth, mol_seq_len, heads, n_hashes,
+                    ff_chunks, attn_chunks, cmd_args, output_folder, train_batch_size, epochs, train_dataset, test_dataset,
+                    validate_every, save_every):
+    enc_dec = ReformerEncDec(
+        dim = dim,
+        bucket_size = bucket_size,
+
+        enc_num_tokens = input_lang.n_words,
+        enc_max_seq_len = vir_seq_len,
+        enc_depth = depth,
+        enc_bucket_size = bucket_size, 
+        return_embeddings = True,
+
+        dec_num_tokens = target_lang.n_words,
+        dec_max_seq_len = mol_seq_len,
+        dec_depth = depth,
+        dec_bucket_size = bucket_size,
+        dec_causal = True,
+        
+        ignore_index = PAD_IDX,
+        pad_value = PAD_IDX,        
+        heads = heads, 
+        n_hashes= n_hashes,
+        ff_chunks = ff_chunks,
+        attn_chunks = attn_chunks, 
+        weight_tie = True,
+        weight_tie_embedding = True,
+        axial_position_emb = True,
+        axial_position_shape = (256, 128),  
+        axial_position_dims = (int(dim/2), int(dim/2)),  
+
+    ).to(device)
+
+    enc_dec_optimizer = RangerLars(enc_dec.parameters()) 
+
+    enc_dec_params = filter(lambda p: p.requires_grad, enc_dec.parameters())
+
+    enc_dec_engine, enc_dec_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, optimizer=enc_dec_optimizer, model_parameters=enc_dec_params, training_data=train_dataset)
+    _, _, testloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, optimizer=enc_dec_optimizer, training_data=test_dataset)
+   
+
+    # training
+    SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
+   
+    try:
+        enc_dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'enc_dec']))])
+    except:
+        enc_dec_ckp_max = 0
+
+    _, enc_dec_client_sd = enc_dec_engine.load_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckp_max) 
+
+    gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
+    print('gpus_mini_batch:', gpus_mini_batch)
+    log_file = open(os.sep.join([output_folder,'training_log.log']), 'a')
+    log_file.write("\n\n\n{}\tStarting new training from chekpoint: EncoderDecoder-{}\n".format(datetime.datetime.now(), enc_dec_ckp_max))
+    log_file.flush()
+
+    for eph in range(epochs):
+        print('Starting Epoch: {}'.format(eph))
+        for i, pair in enumerate(trainloader):
+            tr_step = ((eph*len(trainloader))+i)+1
+
+            src = pair[0]
+            trg = pair[1]
+
+            enc_dec_engine.train()
+            
+            src = src.to(enc_dec_engine.local_rank)
+            trg = trg.to(enc_dec_engine.local_rank)
+
+            ## Need to learn how to use masks correctly
+            # enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in src]).bool().to(device) 
+            # context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in trg]).bool().to(device)
+            #################
+
+            loss = enc_dec(src, trg, return_loss = True, enc_input_mask = None)#enc_input_mask)#, context_mask=context_mask)
+
+            loss.backward()
+
+            enc_dec_engine.step()
+            
+            print('Training Loss:',loss.item())       
+            if tr_step % validate_every == 0:
+                val_loss = []
+                for pair in tqdm(testloader):
+                    enc_dec_engine.eval()
+                    with torch.no_grad():
+                        ts_src = pair[0]
+                        ts_trg = pair[1]
+
+                        ts_src= ts_src.to(enc_dec_engine.local_rank)
+                        ts_trg = ts_trg.to(enc_dec_engine.local_rank)
+
+                        ## Need to learn how to use masks correctly
+                        #ts_enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_src]).bool().to(device)
+                        #ts_context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_trg]).bool().to(device)
+
+                        loss = enc_dec(ts_src, ts_trg, return_loss = True, enc_input_mask = None)#ts_enc_input_mask)#, context_mask=ts_context_mask)
+                        val_loss.append(loss.item())
+
+                print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
+                log_file.write('Step: {}\tTraining Loss:{}\t Validation LOSS: AVG: {}| MEDIAN: {}| STD: {}\n'.format(
+                                                                                                i,
+                                                                                                loss.item(),
+                                                                                                np.mean(val_loss),
+                                                                                                np.median(val_loss),
+                                                                                                np.std(val_loss)))
+            else:
+                log_file.write('Step: {}\tTraining Loss:{}\n'.format(i,loss.item()))
+            
+            log_file.flush()
+
+            if tr_step % save_every == 0:
+                print('\tSaving Checkpoint')
+                enc_dec_ckpt_id = str(enc_dec_ckp_max+tr_step+1)
+                enc_dec_engine.save_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckpt_id)
+                
+    log_file.close()
+    print('\tSaving Final Checkpoint')
+    enc_dec_ckpt_id = str(enc_dec_ckp_max+tr_step+1)
+    enc_dec_engine.save_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckpt_id)
 
 def add_argument():
     parser=argparse.ArgumentParser(description='enwik8')
@@ -66,6 +328,9 @@ def add_argument():
     parser.add_argument('--heads', type=int, default=8, help='Heads')
     parser.add_argument('--n_hashes', type=int, default=4, help='Number of hashes - 4 is permissible per author, 8 is the best but slower') 
 
+    parser.add_argument('--use_encdec_v2', default=False, action='store_true',
+                        help='Use the V2 of the EncDec architecture wrapped by Philip Wang (lucidrain on github)')
+
     parser = deepspeed.add_config_arguments(parser)
     args=parser.parse_args()
     return args
@@ -92,7 +357,11 @@ def main():
     attn_chunks = cmd_args.attn_chunks
     validate_every = cmd_args.validate_every
     save_every = cmd_args.save_every
+
     output_folder = cmd_args.output_folder
+    os.makedirs(output_folder, exist_ok=True)
+
+    use_encdec_v2 = cmd_args.use_encdec_v2
 
     MAX_LENGTH_GEN = max_len_gen # 32768
     MIN_LENGTH_GEN = min_len_gen
@@ -107,195 +376,66 @@ def main():
     MOL_SEQ_LEN = MAX_LENGTH_MOL # output_lang.max_len if (output_lang.max_len % 2) == 0  else output_lang.max_len + 1 # ??
     teacher_forcing_ratio = 0.5
 
-    input_lang, target_lang, tr_pairs, ts_pairs = readGenomes(genome_file_tr=path_to_file_tr, genome_file_ts=path_to_file_ts, 
+    saved_input_lang=os.sep.join([output_folder, 'vir_lang.pkl'])
+    saved_target_lang=os.sep.join([output_folder, 'mol_lang.pkl'])
+    
+    input_lang, target_lang, tr_pairs, ts_pairs = readGenomes(genome_file_tr=path_to_file_tr, genome_file_ts=path_to_file_ts,
+                                                saved_input_lang=saved_input_lang, saved_target_lang=saved_target_lang,
                                                 num_examples_tr=NUM_EXAMPLES_TR, num_examples_ts=NUM_EXAMPLES_TS,
                                                 max_len_genome=MAX_LENGTH_GEN, min_len_genome = MIN_LENGTH_GEN,max_len_molecule=MAX_LENGTH_MOL)
     
-    pickle.dump(input_lang, open(os.sep.join([output_folder, 'vir_lang.pkl']), 'wb'))
-    pickle.dump(target_lang, open(os.sep.join([output_folder, 'mol_lang.pkl']), 'wb'))
+    pickle.dump(input_lang, open(saved_input_lang, 'wb'))
+    pickle.dump(target_lang, open(saved_target_lang, 'wb'))
 
     train_dataset = GenomeToMolDataset(tr_pairs, input_lang, target_lang)
     test_dataset = GenomeToMolDataset(ts_pairs, input_lang, target_lang)
 
+    if use_encdec_v2:
+        train_encdec_v2(
+            input_lang=input_lang, 
+            target_lang=target_lang, 
+            dim=dim, 
+            bucket_size=bucket_size, 
+            vir_seq_len=VIR_SEQ_LEN, 
+            depth=depth, 
+            mol_seq_len=MOL_SEQ_LEN, 
+            heads=heads, 
+            n_hashes=n_hashes,
+            ff_chunks=ff_chunks, 
+            attn_chunks=attn_chunks, 
+            cmd_args=cmd_args, 
+            output_folder=output_folder, 
+            train_batch_size=train_batch_size, 
+            epochs=epochs, 
+            train_dataset=train_dataset, 
+            test_dataset=test_dataset,
+            validate_every=VALIDATE_EVERY, 
+            save_every=SAVE_EVERY
+        )
+    else:
+        train_encdec_v1(
+            input_lang=input_lang,
+            target_lang=target_lang, 
+            dim=dim, 
+            bucket_size=bucket_size, 
+            depth=depth, 
+            heads=heads, 
+            n_hashes=n_hashes, 
+            vir_seq_len=VIR_SEQ_LEN, 
+            ff_chunks=ff_chunks, 
+            attn_chunks=attn_chunks,
+            mol_seq_len=MOL_SEQ_LEN, 
+            cmd_args=cmd_args, 
+            train_dataset=train_dataset, 
+            test_dataset=test_dataset, 
+            output_folder=output_folder, 
+            train_batch_size=train_batch_size,
+            epochs=epochs,
+            validate_every=VALIDATE_EVERY, 
+            save_every=SAVE_EVERY
+        )
 
-    # encoder = ReformerLM(
-    #     num_tokens = input_lang.n_words,
-    #     dim = dim,#512,
-    #     bucket_size = bucket_size, # 16,
-    #     depth = depth, # 6,
-    #     heads = heads, # 8,
-    #     n_hashes= n_hashes,
-    #     max_seq_len = VIR_SEQ_LEN,
-    #     ff_chunks = ff_chunks, #400,      # number of chunks for feedforward layer, make higher if there are memory issues
-    #     attn_chunks = attn_chunks, #16,    # process lsh attention in chunks, only way for memory to fit when scaling to 16k tokens
-    #     weight_tie = True,
-    #     weight_tie_embedding = True,
-    #     axial_position_emb = True,
-    #     axial_position_shape = (256, 128),  # the shape must multiply up to the max_seq_len (256 x 128 = 32768)
-    #     axial_position_dims = (int(dim/2), int(dim/2)),  # the dims must sum up to the model dimensions (512 + 512 = 1024)
-    #     return_embeddings = True # return output of last attention layer
-    # ).cuda()
 
-    # decoder = ReformerLM(
-    #     num_tokens = target_lang.n_words,
-    #     dim = dim, # 512,
-    #     bucket_size = bucket_size, #16,
-    #     depth = depth, #6,
-    #     heads = heads, #8,
-    #     n_hashes= n_hashes,
-    #     ff_chunks = ff_chunks, # 400,      # number of chunks for feedforward layer, make higher if there are memory issues
-    #     attn_chunks = attn_chunks, # 16,    # process lsh attention in chunks, only way for memory to fit when scaling to 16k tokens
-    #     max_seq_len = MOL_SEQ_LEN,
-    #     axial_position_emb = True,
-    #     axial_position_shape = (64, 32),  # the shape must multiply up to the max_seq_len (64 x 32 = 2048)
-    #     axial_position_dims = (int(dim/2), int(dim/2)),  # the dims must sum up to the model dimensions (512 + 512 = 1024)
-    #     weight_tie = True,
-    #     weight_tie_embedding = True,
-    #     causal = True
-    # ).cuda()
-
-    enc_dec = ReformerEncDec(
-        dim = dim,#512,
-        bucket_size = bucket_size,
-
-        enc_num_tokens = input_lang.n_words,
-        enc_max_seq_len = VIR_SEQ_LEN,
-        enc_depth = depth, # 6,
-        enc_bucket_size = bucket_size, # 16,
-        return_embeddings = True,
-
-        dec_num_tokens = target_lang.n_words,
-        dec_max_seq_len = MOL_SEQ_LEN,
-        dec_depth = depth,
-        dec_bucket_size = bucket_size,
-        dec_causal = True,
-        
-        ignore_index = PAD_IDX,
-        pad_value = PAD_IDX,        
-        heads = heads, # 8,
-        n_hashes= n_hashes,
-        ff_chunks = ff_chunks, #400,      # number of chunks for feedforward layer, make higher if there are memory issues
-        attn_chunks = attn_chunks, #16,    # process lsh attention in chunks, only way for memory to fit when scaling to 16k tokens
-        weight_tie = True,
-        weight_tie_embedding = True,
-        axial_position_emb = True,
-        axial_position_shape = (256, 128),  # the shape must multiply up to the max_seq_len (256 x 128 = 32768)
-        axial_position_dims = (int(dim/2), int(dim/2)),  # the dims must sum up to the model dimensions (512 + 512 = 1024)
-
-    ).to(device)
-
-    # encoder_optimizer = RangerLars(encoder.parameters()) 
-    # decoder_optimizer = RangerLars(decoder.parameters()) 
-    enc_dec_optimizer = RangerLars(enc_dec.parameters()) 
-
-    # encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).cuda()
-    # decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).cuda()
-    #enc_dec = TrainingWrapper(enc_dec, ignore_index=PAD_IDX, pad_value=PAD_IDX).cuda()
-
-    # encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
-    # decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
-    enc_dec_params = filter(lambda p: p.requires_grad, enc_dec.parameters())
-
-    # encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=encoder, optimizer=encoder_optimizer, model_parameters=encoder_params, training_data=train_dataset, dist_init_required=True)
-    # decoder_engine, decoder_optimizer, _, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, model_parameters=encoder_params, dist_init_required=False)
-    enc_dec_engine, enc_dec_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, optimizer=enc_dec_optimizer, model_parameters=enc_dec_params, training_data=train_dataset)
-    _, _, testloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, optimizer=enc_dec_optimizer, training_data=test_dataset)
-   
-
-    # training
-    SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
-
-    # try:
-    #     enc_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'encoder/')])
-    # except Exception as e:
-    #     print('Exception:', e)
-    #     enc_ckp_max = 0
-    
-    # try:
-    #     dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'decoder/')])
-    # except:
-    #     dec_ckp_max = 0
-
-    try:
-        enc_dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'enc_dec']))])
-    except:
-        enc_dec_ckp_max = 0
-
-    # _, encoder_client_sd = encoder_engine.load_checkpoint(SAVE_DIR+'encoder/', enc_ckp_max)
-    # _, decoder_client_sd = decoder_engine.load_checkpoint(SAVE_DIR+'decoder/', dec_ckp_max) 
-
-    _, enc_dec_client_sd = enc_dec_engine.load_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckp_max) 
-
-    gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
-    print('gpus_mini_batch:', gpus_mini_batch)
-    log_file = open(os.sep.join([output_folder,'training_log.log']), 'a')
-    # log_file.write("\n\n\n{}\tStarting new training from chekpoint: Encoder-{} | Decoder-{}\n".format(datetime.datetime.now(), enc_ckp_max, dec_ckp_max))
-    log_file.write("\n\n\n{}\tStarting new training from chekpoint: EncoderDecoder-{}\n".format(datetime.datetime.now(), enc_dec_ckp_max))
-    log_file.flush()
-
-    for eph in range(epochs):
-        print('Starting Epoch: {}'.format(eph))
-        for i, pair in enumerate(trainloader):
-            tr_step = ((eph*len(trainloader))+i)+1
-
-            src = pair[0]
-            trg = pair[1]
-
-            enc_dec_engine.train()
-            
-            src = src.to(enc_dec_engine.local_rank)
-            trg = trg.to(enc_dec_engine.local_rank)
-
-            #enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in src]).bool().to(device)
-            #context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in trg]).bool().to(device)
-            #enc_input_mask = torch.ones(1, VIR_SEQ_LEN).bool().to(device)
-
-            loss = enc_dec(src, trg, return_loss = True, enc_input_mask = None)#enc_input_mask)#, context_mask=context_mask)
-
-            loss.backward()
-
-            enc_dec_engine.step()
-            
-            print('Training Loss:',loss.item())       
-            if tr_step % VALIDATE_EVERY == 0:
-                val_loss = []
-                for pair in tqdm(testloader):
-                    enc_dec_engine.eval()
-                    with torch.no_grad():
-                        ts_src = pair[0]
-                        ts_trg = pair[1]
-
-                        ts_src= ts_src.to(enc_dec_engine.local_rank)
-                        ts_trg = ts_trg.to(enc_dec_engine.local_rank)
-
-                        #ts_enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_src]).bool().to(device)
-                        #ts_context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_trg]).bool().to(device)
-                        #ts_enc_input_mask = torch.ones(1, VIR_SEQ_LEN).bool().to(device)
-
-                        loss = enc_dec(ts_src, ts_trg, return_loss = True, enc_input_mask = None)#ts_enc_input_mask)#, context_mask=ts_context_mask)
-                        val_loss.append(loss.item())
-
-                print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
-                log_file.write('Step: {}\tTraining Loss:{}\t Validation LOSS: AVG: {}| MEDIAN: {}| STD: {}\n'.format(
-                                                                                                i,
-                                                                                                loss.item(),
-                                                                                                np.mean(val_loss),
-                                                                                                np.median(val_loss),
-                                                                                                np.std(val_loss)))
-            else:
-                log_file.write('Step: {}\tTraining Loss:{}\n'.format(i,loss.item()))
-            
-            log_file.flush()
-
-            if tr_step % SAVE_EVERY == 0:
-                print('\tSaving Checkpoint')
-                enc_dec_ckpt_id = str(enc_dec_ckp_max+tr_step+1)
-                enc_dec_engine.save_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckpt_id)
-                
-    log_file.close()
-    print('\tSaving Final Checkpoint')
-    enc_dec_ckpt_id = str(enc_dec_ckp_max+tr_step+1)
-    enc_dec_engine.save_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckpt_id)
 
 if __name__ == '__main__':
     main()
