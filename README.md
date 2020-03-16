@@ -99,6 +99,9 @@ This is a work in progress, I'll surely do some mistakes or miss something. I'm 
 
 ## Credits
 
+DeepSpeed by Microsoft:
+- https://github.com/microsoft/DeepSpeed
+
 Optimizer by: Over9000: 
 - https://github.com/mgrankin/over9000
 
