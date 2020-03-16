@@ -3,6 +3,7 @@ import csv
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 import pickle
+import os
 
 PAD_IDX = 0
 SOS_token = 1
@@ -130,17 +131,17 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
             mol.append("PAD")
         ts_pairs[i][1] = ' '.join(mol)
 
-    if not saved_input_lang or not saved_target_lang:
-        for pair in tr_pairs:
-            input_lang.addSentence(pair[0])
-            output_lang.addSentence(pair[1])
-
-        for pair in ts_pairs:
-            input_lang.addSentence(pair[0])
-            output_lang.addSentence(pair[1])
-    else:
+    if os.path.exists(saved_input_lang) and os.path.exists(saved_target_lang):
         input_lang = pickle.load(open(saved_input_lang, 'rb'))
         target_lang = pickle.load(open(saved_target_lang, 'rb'))
+
+    for pair in tr_pairs:
+        input_lang.addSentence(pair[0])
+        output_lang.addSentence(pair[1])
+
+    for pair in ts_pairs:
+        input_lang.addSentence(pair[0])
+        output_lang.addSentence(pair[1])        
 
     print("Counted words:")
     print(input_lang.name, input_lang.n_words)
