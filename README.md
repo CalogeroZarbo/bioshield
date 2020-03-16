@@ -40,10 +40,10 @@ genome nomenclatures I found in the ViralGenomes DB so by using a genome-browser
 The instruction to download the curated file are in the `DatasetCreation.ipynb` notebook.
 
 Premade Genome to SMILE files can be found here:
-- Training:
+- Training: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol_tr.csv
 - Testing: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol_ts.csv
 - Validation: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol_val.csv
-- Complete Dataset: 
+- Complete Dataset: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol.csv
 
 ## Reformer Model Enc-Dec for Seq2Seq Model
 
