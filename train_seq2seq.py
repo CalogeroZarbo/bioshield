@@ -286,7 +286,7 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
     enc_dec_engine.save_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckpt_id)
 
 def add_argument():
-    parser=argparse.ArgumentParser(description='enwik8')
+    parser=argparse.ArgumentParser(description='Train Transformer Model for Genome to SMILE translation.')
 
     parser.add_argument('--with_cuda', default=False, action='store_true',
                         help='use CPU in case there\'s no GPU support')
