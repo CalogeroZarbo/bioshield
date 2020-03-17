@@ -357,11 +357,12 @@ def main():
     attn_chunks = cmd_args.attn_chunks
     validate_every = cmd_args.validate_every
     save_every = cmd_args.save_every
-
     output_folder = cmd_args.output_folder
+    use_encdec_v2 = cmd_args.use_encdec_v2
+
     os.makedirs(output_folder, exist_ok=True)
 
-    use_encdec_v2 = cmd_args.use_encdec_v2
+    pickle.dump(cmd_args, open(os.sep.join([output_folder, 'training_conf.pkl']), 'wb'))
 
     MAX_LENGTH_GEN = max_len_gen # 32768
     MIN_LENGTH_GEN = min_len_gen
@@ -374,7 +375,6 @@ def main():
 
     VIR_SEQ_LEN = MAX_LENGTH_GEN # input_lang.max_len if (input_lang.max_len % 2) == 0  else input_lang.max_len + 1 # 32000
     MOL_SEQ_LEN = MAX_LENGTH_MOL # output_lang.max_len if (output_lang.max_len % 2) == 0  else output_lang.max_len + 1 # ??
-    teacher_forcing_ratio = 0.5
 
     saved_input_lang=os.sep.join([output_folder, 'vir_lang.pkl'])
     saved_target_lang=os.sep.join([output_folder, 'mol_lang.pkl'])
