@@ -19,13 +19,14 @@ import datetime
 import os
 from utils import *
 import pickle
+import json
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
 
 def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_hashes, vir_seq_len, ff_chunks, attn_chunks,
                     mol_seq_len, cmd_args, train_dataset, test_dataset, output_folder, train_batch_size, epochs,
-                    validate_every, save_every):
+                    validate_every, save_every, zero_optimization):
     encoder = ReformerLM(
         num_tokens = input_lang.n_words,
         dim = dim,
@@ -65,6 +66,9 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
     encoder_optimizer = RangerLars(encoder.parameters()) 
     decoder_optimizer = RangerLars(decoder.parameters()) 
     
+    if zero_optimization:
+        encoder_optimizer = deepspeed.pt.deepspeed_zero_optimizer.FP16_DeepSpeedZeroOptimizer(encoder_optimizer)
+        decoder_optimizer = deepspeed.pt.deepspeed_zero_optimizer.FP16_DeepSpeedZeroOptimizer(decoder_optimizer)
 
     encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
     decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
@@ -80,6 +84,7 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
    
 
     SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
+    os.makedirs(SAVE_DIR, exist_ok=True)
 
     try:
         enc_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'encoder']))])
@@ -165,7 +170,7 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
 
 def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, depth, mol_seq_len, heads, n_hashes,
                     ff_chunks, attn_chunks, cmd_args, output_folder, train_batch_size, epochs, train_dataset, test_dataset,
-                    validate_every, save_every):
+                    validate_every, save_every, zero_optimization):
     enc_dec = ReformerEncDec(
         dim = dim,
         bucket_size = bucket_size,
@@ -206,6 +211,7 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
 
     # training
     SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
+    os.makedirs(SAVE_DIR, exist_ok=True)
    
     try:
         enc_dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'enc_dec']))])
@@ -319,12 +325,13 @@ def add_argument():
 
     parser.add_argument('--path_to_file_tr', default='./gen_to_mol_tr.csv', help='Trainig file') 
     parser.add_argument('--path_to_file_ts', default='./gen_to_mol_ts.csv', help='Testing file') 
+    parser.add_argument('--ds_conf', default='./ds_config.json', help='DeepSpeed configuration file') 
     parser.add_argument('--max_len_gen', type=int, default=32768, help='Max nucleotides per genome') 
     parser.add_argument('--min_len_gen', type=int, default=-1, help='Max nucleotides per genome') 
     parser.add_argument('--max_len_mol', type=int, default=2048, help='Max symbols for Canonical SMILES') 
     parser.add_argument('--num_examples_tr', type=int, default=1024, help='Max number of samples TR') 
     parser.add_argument('--num_examples_ts', type=int, default=1024, help='Max number of samples TS') 
-    parser.add_argument('--train_batch_size', type=int,default=8, help='Batch size') 
+    #parser.add_argument('--train_batch_size', type=int,default=8, help='Batch size') 
     parser.add_argument('--heads', type=int, default=8, help='Heads')
     parser.add_argument('--n_hashes', type=int, default=4, help='Number of hashes - 4 is permissible per author, 8 is the best but slower') 
 
@@ -345,7 +352,10 @@ def main():
     max_len_mol = cmd_args.max_len_mol
     num_examples_tr = cmd_args.num_examples_tr
     num_examples_ts = cmd_args.num_examples_ts
-    train_batch_size = cmd_args.train_batch_size
+
+    train_batch_size = json.load(open(cmd_args.ds_conf))['train_batch_size']#cmd_args.train_batch_size
+    zero_optimization = json.load(open(cmd_args.ds_conf))['zero_optimization']
+
     epochs = cmd_args.epochs
     emb_dim = cmd_args.emb_dim
     dim = cmd_args.dim
@@ -387,8 +397,8 @@ def main():
     pickle.dump(input_lang, open(saved_input_lang, 'wb'))
     pickle.dump(target_lang, open(saved_target_lang, 'wb'))
 
-    train_dataset = GenomeToMolDataset(tr_pairs, input_lang, target_lang)
-    test_dataset = GenomeToMolDataset(ts_pairs, input_lang, target_lang)
+    train_dataset = GenomeToMolDataset(tr_pairs, input_lang, target_lang, train_batch_size if device == 'cuda' else 1)
+    test_dataset = GenomeToMolDataset(ts_pairs, input_lang, target_lang, train_batch_size if device == 'cuda' else 1)
 
     if use_encdec_v2:
         train_encdec_v2(
@@ -410,7 +420,8 @@ def main():
             train_dataset=train_dataset, 
             test_dataset=test_dataset,
             validate_every=VALIDATE_EVERY, 
-            save_every=SAVE_EVERY
+            save_every=SAVE_EVERY,
+            zero_optimization=zero_optimization
         )
     else:
         train_encdec_v1(
@@ -432,7 +443,8 @@ def main():
             train_batch_size=train_batch_size,
             epochs=epochs,
             validate_every=VALIDATE_EVERY, 
-            save_every=SAVE_EVERY
+            save_every=SAVE_EVERY,
+            zero_optimization=zero_optimization
         )
 
 
