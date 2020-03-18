@@ -98,12 +98,6 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
     if reverse:
         tr_pairs = [list(reversed(p)) for p in tr_pairs]
         ts_pairs = [list(reversed(p)) for p in ts_pairs]
-        input_lang = Lang(lang2)
-        output_lang = Lang(lang1)
-    else:
-        input_lang = Lang(lang1)
-        output_lang = Lang(lang2)
-    
     print("Read %s sentence pairs training" % len(tr_pairs))
     print("Trimmed to %s sentence pairs training" % len(tr_pairs))
     print("Read %s sentence pairs test" % len(ts_pairs))
@@ -132,8 +126,15 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
         ts_pairs[i][1] = ' '.join(mol)
 
     if os.path.exists(saved_input_lang) and os.path.exists(saved_target_lang):
+        print('Loading saved vocabs.')
         input_lang = pickle.load(open(saved_input_lang, 'rb'))
-        target_lang = pickle.load(open(saved_target_lang, 'rb'))
+        output_lang = pickle.load(open(saved_target_lang, 'rb'))
+        print('input tokens', input_lang.n_words)
+        print('target_lang',output_lang.n_words)
+    else:
+        input_lang = Lang(lang2)
+        output_lang = Lang(lang1)
+
 
     for pair in tr_pairs:
         input_lang.addSentence(pair[0])
@@ -157,11 +158,12 @@ def indexesFromSentence(lang, sentence):
     return [lang.word2index[word] for word in sentence.split(' ')]
 
 class GenomeToMolDataset(Dataset):
-    def __init__(self, data, src_lang, trg_lang):
+    def __init__(self, data, src_lang, trg_lang, segmentation=1):
         super().__init__()
         self.data = data
         self.src_lang = src_lang
         self.trg_lang = trg_lang
+        self.segmentation = segmentation
 
     def __getitem__(self, index):
         pair = self.data[index]
@@ -170,4 +172,4 @@ class GenomeToMolDataset(Dataset):
         return src,trg
 
     def __len__(self):
-        return len(self.data)
+        return int(len(self.data) / self.segmentation)
