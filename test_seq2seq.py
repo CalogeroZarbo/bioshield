@@ -7,12 +7,12 @@ import numpy as np
 from utils import readGenomes, GenomeToMolDataset
 from tqdm import tqdm
 import pickle
+from utils import *
+import argparse
+import deepspeed
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
-PAD_IDX = 0
-SOS_token = 1
-EOS_token = 2
 
 def convert_ds_chkpt(ds_chkpt, device):
     ds_state_dict = torch.load(ds_chkpt, map_location=torch.device(device)) 
@@ -22,156 +22,389 @@ def convert_ds_chkpt(ds_chkpt, device):
         torch_state_dic[k] = v 
     return torch_state_dic
 
+def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_hashes, vir_seq_len, ff_chunks, attn_chunks,
+                    mol_seq_len, cmd_args, train_dataset, test_dataset, output_folder, train_batch_size, epochs,
+                    validate_every, save_every, checkpoint_id):
+    results = {
+        'generated_seq':[],
+        'generated_mol':[],
+        'target_mol':[],
+        'input_genome':[]
+    }
 
-encoder_checkpoint = './saved_model/encoder/201/mp_rank_00_model_states.pt'
-decoder_checkpoint = './saved_model/decoder/201/mp_rank_00_model_states.pt'
+    encoder = ReformerLM(
+        num_tokens = input_lang.n_words,
+        dim = dim,
+        bucket_size = bucket_size,
+        depth = depth, 
+        heads = heads, 
+        n_hashes= n_hashes,
+        max_seq_len = vir_seq_len,
+        ff_chunks = ff_chunks, 
+        attn_chunks = attn_chunks, 
+        weight_tie = True,
+        weight_tie_embedding = True,
+        axial_position_emb = True,
+        axial_position_shape = (256, 128),  
+        axial_position_dims = (int(dim/2), int(dim/2)),  
+        return_embeddings = True 
+    ).to(device)
 
-dim = 768
-bucket_size = 64
-depth = 12
-heads = 8
-n_hashes = 4
-VIR_SEQ_LEN = 32768
-ff_chunks = 200
-attn_chunks = 8
-MOL_SEQ_LEN = 2048
+    decoder = ReformerLM(
+        num_tokens = target_lang.n_words,
+        dim = dim, 
+        bucket_size = bucket_size,
+        depth = depth, 
+        heads = heads, 
+        n_hashes= n_hashes,
+        ff_chunks = ff_chunks, 
+        attn_chunks = attn_chunks, 
+        max_seq_len = mol_seq_len,
+        axial_position_emb = True,
+        axial_position_shape = (64, 32),  
+        axial_position_dims = (int(dim/2), int(dim/2)), 
+        weight_tie = True,
+        weight_tie_embedding = True,
+        causal = True
+    ).to(device)
 
-output_folder = './training_output/'
+    encoder_optimizer = RangerLars(encoder.parameters()) 
+    decoder_optimizer = RangerLars(decoder.parameters()) 
+    
 
-input_lang, target_lang, tr_pairs, ts_pairs = readGenomes(genome_file_tr='./gen_to_mol_tr.csv', genome_file_ts='./gen_to_mol_ts.csv', 
-                                                saved_input_lang='./vir_lang.pkl', saved_target_lang='./mol_lang.pkl',
-                                                num_examples_tr=50000, num_examples_ts=100,
-                                                max_len_genome=VIR_SEQ_LEN, min_len_genome = -1,max_len_molecule=MOL_SEQ_LEN)
+    encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
+    decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
+    
+    '''
+    encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
+    decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
 
-pickle.dump(input_lang, open('vir_lang.pkl', 'wb'))
-pickle.dump(target_lang, open('mol_lang.pkl', 'wb'))
+    encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=encoder, optimizer=encoder_optimizer, model_parameters=encoder_params, training_data=train_dataset, dist_init_required=True)
+    decoder_engine, decoder_optimizer, testloader, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, model_parameters=encoder_params, training_data=test_dataset, dist_init_required=False)
+    
+    SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
 
-train_dataset = GenomeToMolDataset(tr_pairs, input_lang, target_lang)
-test_dataset = GenomeToMolDataset(ts_pairs, input_lang, target_lang)
+    if checkpoint_id:
+        enc_ckp_max = checkpoint_id
+        dec_ckp_max = checkpoint_id
+    else:
+        try:
+            enc_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'encoder']))])
+        except Exception as e:
+            print('Exception:', e)
+            enc_ckp_max = 0
+        
+        try:
+            dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(os.sep.join([SAVE_DIR,'decoder']))])
+        except:
+            dec_ckp_max = 0
 
-encoder = ReformerLM(
-    num_tokens = 11,#input_lang.n_words,
-    dim = dim,#512,
-    bucket_size = bucket_size, # 16,
-    depth = depth, # 6,
-    heads = heads, # 8,
-    n_hashes= n_hashes,
-    max_seq_len = VIR_SEQ_LEN,
-    ff_chunks = ff_chunks, #400,      # number of chunks for feedforward layer, make higher if there are memory issues
-    attn_chunks = attn_chunks, #16,    # process lsh attention in chunks, only way for memory to fit when scaling to 16k tokens
-    weight_tie = True,
-    weight_tie_embedding = True,
-    axial_position_emb = True,
-    axial_position_shape = (256, 128),  # the shape must multiply up to the max_seq_len (256 x 128 = 32768)
-    axial_position_dims = (int(dim/2), int(dim/2)),  # the dims must sum up to the model dimensions (512 + 512 = 1024)
-    return_embeddings = True # return output of last attention layer
-).to(device)
+    _, encoder_client_sd = encoder_engine.load_checkpoint(os.sep.join([SAVE_DIR,'encoder']), enc_ckp_max)
+    _, decoder_client_sd = decoder_engine.load_checkpoint(os.sep.join([SAVE_DIR,'decoder']), dec_ckp_max) 
 
-decoder = ReformerLM(
-    num_tokens = 51,#target_lang.n_words,
-    dim = dim, # 512,
-    bucket_size = bucket_size, #16,
-    depth = depth, #6,
-    heads = heads, #8,
-    n_hashes= n_hashes,
-    ff_chunks = ff_chunks, # 400,      # number of chunks for feedforward layer, make higher if there are memory issues
-    attn_chunks = attn_chunks, # 16,    # process lsh attention in chunks, only way for memory to fit when scaling to 16k tokens
-    max_seq_len = MOL_SEQ_LEN,
-    axial_position_emb = True,
-    axial_position_shape = (64, 32),  # the shape must multiply up to the max_seq_len (64 x 32 = 2048)
-    axial_position_dims = (int(dim/2), int(dim/2)),  # the dims must sum up to the model dimensions (512 + 512 = 1024)
-    weight_tie = True,
-    weight_tie_embedding = True,
-    causal = True
-).to(device)
+    gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
+    
+    for pair in testloader:
+        encoder_engine.eval()
+        decoder_engine.eval()
+        with torch.no_grad():
+            ts_src = pair[0]
+            ts_trg = pair[1]
+
+            input_genome = [[input_lang.index2word[gen_idx.item()] for gen_idx in smpl] for smpl in pair[0]]            
+            target_mol = [[target_lang.index2word[mol_idx.item()] for mol_idx in smpl] for smpl in pair[1]]
+            
+            ts_src= ts_src.to(encoder_engine.local_rank)
+            ts_trg = ts_trg.to(decoder_engine.local_rank)
+
+            enc_keys = encoder_engine(ts_src)
+            yi = torch.tensor([[SOS_token] for _ in range(gpus_mini_batch)]).long().to(decoder_engine.local_rank) 
+            
+            sample = decoder_engine.generate(yi, mol_seq_len, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token)
+            actual_mol = ''
+            for mol_seq in sample.cpu().numpy():
+                for mol_idx in mol_seq:
+                    actual_mol += target_lang.index2word[mol_idx]
+                print('Generated Seq:', sample)
+                print('Generated Mol:', actual_mol)
+                print('Real Mol:', target_mol)
+
+                results['generated_seq'].append(sample)
+                results['generated_mol'].append(actual_mol)
+                results['target_mol'].append(target_mol)
+                results['input_genome'].append(input_genome)
+    
+    print('Saving Test Results..')
+    pickle.dump(results, open(os.sep.join([output_folder,'test_results.pkl']), 'wb'))
+    '''
+
+    encoder_checkpoint = os.sep.join([output_folder, 'saved_model', 'encoder', checkpoint_id, 'mp_rank_00_model_states.pt'])
+    decoder_checkpoint = os.sep.join([output_folder, 'saved_model', 'decoder', checkpoint_id, 'mp_rank_00_model_states.pt'])
+    
+    encoder.load_state_dict(torch.load(encoder_checkpoint, map_location=torch.device(device))['module'])
+    decoder.load_state_dict(torch.load(decoder_checkpoint, map_location=torch.device(device))['module'])
+
+    for pair in test_dataset:
+        encoder.eval()
+        decoder.eval()
+        with torch.no_grad():
+            ts_src = torch.tensor(np.array([pair[0].numpy()])).to(device)
+            ts_trg = torch.tensor(np.array([pair[1].numpy()])).to(device)
+
+            input_genome = [input_lang.index2word[gen_idx.item()] for gen_idx in pair[0]]         
+            target_mol = [target_lang.index2word[mol_idx.item()] for mol_idx in pair[1]] 
+            
+            enc_keys = encoder(ts_src)
+            yi = torch.tensor([[SOS_token]]).long().to(device) 
+            
+            sample = decoder.generate(yi, mol_seq_len, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token)
+            actual_mol = ''
+            for mol_seq in sample.cpu().numpy():
+                for mol_idx in mol_seq:
+                    actual_mol += target_lang.index2word[mol_idx]
+                print('Generated Seq:', sample)
+                print('Generated Mol:', actual_mol)
+                print('Real Mol:', target_mol)
+
+                results['generated_seq'].append(sample)
+                results['generated_mol'].append(actual_mol)
+                results['target_mol'].append(target_mol)
+                results['input_genome'].append(input_genome)
+    
+    print('Saving Test Results..')
+    pickle.dump(results, open(os.sep.join([output_folder,'test_results.pkl']), 'wb'))
+
+    '''
+    val_loss = []
+    for pair in tqdm(test_dataset):
+        encoder.eval()
+        decoder.eval()
+        with torch.no_grad():
+            ts_src = torch.tensor(np.array([pair[0].numpy()])).to(device)
+            ts_trg = torch.tensor(np.array([pair[1].numpy()])).to(device)
+            enc_keys = encoder(ts_src)
+            loss = decoder(ts_trg, keys=enc_keys, return_loss = True)
+            val_loss.append(loss.item())
+            print('Loss:', loss.item())
+
+    print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
+    '''
 
 
-#encoder_optimizer = RangerLars(encoder.parameters()) 
-#decoder_optimizer = RangerLars(decoder.parameters()) 
+def test_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, depth, mol_seq_len, heads, n_hashes,
+                    ff_chunks, attn_chunks, cmd_args, output_folder, train_batch_size, epochs, train_dataset, test_dataset,
+                    validate_every, save_every, checkpoint_id):
+    print('Not implemented yet.')
+    pass
 
-encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX)
-decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX)
+def main():
+    parser=argparse.ArgumentParser(description='Testing Transformer model for Genome to SMILE translation.')
+    parser.add_argument('--training_folder', type=str,default='./training_output',
+                        help='the folder where the training output has been stored')
+    parser.add_argument('--checkpoint_id', type=str, default='1',
+                        help='the checkpoint id to restore')
+    parser.add_argument('--num_examples_ts', type=int, default=1024, help='Max number of samples TS')
+    parser.add_argument('--local_rank', type=int, default=-1, help='local rank passed from distributed launcher')
 
-encoder.load_state_dict(torch.load(encoder_checkpoint, map_location=torch.device(device))['module'])
-decoder.load_state_dict(torch.load(decoder_checkpoint, map_location=torch.device(device))['module'])
+    parser = deepspeed.add_config_arguments(parser)
+    args=parser.parse_args()
 
-enc_params_size_trainable = sum([np.prod(p.size()) for p in filter(lambda p: p.requires_grad, encoder.parameters())])
-dec_params_size_trainable = sum([np.prod(p.size()) for p in filter(lambda p: p.requires_grad, decoder.parameters())])
+    training_folder = args.training_folder
+    checkpoint_id = args.checkpoint_id
 
-enc_params_size = sum([np.prod(p.size()) for p in encoder.parameters()])
-dec_params_size = sum([np.prod(p.size()) for p in decoder.parameters()])
+    cmd_args = pickle.load(open(os.sep.join([training_folder,'training_conf.pkl']), 'rb'))
 
-print('Total parameters:', enc_params_size+dec_params_size)
-print('Total trainable parameters:', enc_params_size_trainable+dec_params_size_trainable)
+    #encoder_checkpoint = os.sep.join([training_folder, 'saved_model', 'encoder', checkpoint_id,'mp_rank_00_model_states.pt']) 
+    #decoder_checkpoint = './saved_model/decoder/201/mp_rank_00_model_states.pt'
 
-# for pair in tqdm(test_dataset):
-#     encoder.eval()
-#     decoder.eval()
-#     with torch.no_grad():
-#         ts_src = torch.tensor(np.array([pair[0].numpy()])).to(device)
-#         ts_trg = torch.tensor(np.array([pair[1].numpy()])).to(device)
-#         enc_keys = encoder(ts_src)
-#         yi = torch.tensor([[SOS_token]]).long().to(device) # assume you are sampling batch size of 2, start tokens are id of 0
-#         sample = decoder.generate(yi, MOL_SEQ_LEN, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token) # (2, <= 1024)
-#         actual_mol = ''
-#         for mol_seq in sample.cpu().numpy():
-#             for mol_idx in mol_seq:
-#                 actual_mol += target_lang.index2word[mol_idx]
-#             print('Generated Seq:', sample)
-#             print('Generated Mol:', actual_mol)
-#             print('Real Mol:', [target_lang.index2word[mol_idx] for mol_idx in pair[1]])
+    path_to_file_tr = cmd_args.path_to_file_tr
+    path_to_file_ts =  cmd_args.path_to_file_ts
+    max_len_gen = cmd_args.max_len_gen
+    min_len_gen = cmd_args.min_len_gen
+    max_len_mol = cmd_args.max_len_mol
+    #num_examples_tr = cmd_args.num_examples_tr
+    num_examples_ts = args.num_examples_ts
+    train_batch_size = cmd_args.train_batch_size
+    epochs = cmd_args.epochs
+    emb_dim = cmd_args.emb_dim
+    dim = cmd_args.dim
+    bucket_size = cmd_args.bucket_size
+    depth = cmd_args.depth
+    heads = cmd_args.heads
+    n_hashes = cmd_args.n_hashes
+    ff_chunks = cmd_args.ff_chunks
+    attn_chunks = cmd_args.attn_chunks
+    validate_every = cmd_args.validate_every
+    save_every = cmd_args.save_every
+    output_folder = cmd_args.output_folder
+    use_encdec_v2 = cmd_args.use_encdec_v2
+
+    MAX_LENGTH_GEN = max_len_gen # 32768
+    MIN_LENGTH_GEN = min_len_gen
+    MAX_LENGTH_MOL = max_len_mol # 2048
+    NUM_EXAMPLES_TR = 1#num_examples_tr # 1024
+    NUM_EXAMPLES_TS = num_examples_ts # 1024
+    N_EPOCHS = epochs # 10
+    VALIDATE_EVERY = validate_every
+    SAVE_EVERY = save_every
+
+    VIR_SEQ_LEN = MAX_LENGTH_GEN # input_lang.max_len if (input_lang.max_len % 2) == 0  else input_lang.max_len + 1 # 32000
+    MOL_SEQ_LEN = MAX_LENGTH_MOL # output_lang.max_len if (output_lang.max_len % 2) == 0  else output_lang.max_len + 1 # ??
+
+    saved_input_lang=os.sep.join([output_folder, 'vir_lang.pkl'])
+    saved_target_lang=os.sep.join([output_folder, 'mol_lang.pkl'])
+
+    input_lang, target_lang, tr_pairs, ts_pairs = readGenomes(genome_file_tr=path_to_file_tr, genome_file_ts=path_to_file_ts,
+                                                saved_input_lang=saved_input_lang, saved_target_lang=saved_target_lang,
+                                                num_examples_tr=NUM_EXAMPLES_TR, num_examples_ts=NUM_EXAMPLES_TS,
+                                                max_len_genome=MAX_LENGTH_GEN, min_len_genome = MIN_LENGTH_GEN,max_len_molecule=MAX_LENGTH_MOL)
+
+    #pickle.dump(input_lang, open(saved_input_lang, 'wb'))
+    #pickle.dump(target_lang, open(saved_target_lang, 'wb'))
+
+    train_dataset = GenomeToMolDataset(tr_pairs, input_lang, target_lang, train_batch_size if device == 'cuda' else 1)
+    test_dataset = GenomeToMolDataset(ts_pairs, input_lang, target_lang, train_batch_size if device == 'cuda' else 1)
+
+    ### Prapring the improved version
+    if use_encdec_v2:
+        test_encdec_v2(
+            input_lang=input_lang, 
+            target_lang=target_lang, 
+            dim=dim, 
+            bucket_size=bucket_size, 
+            vir_seq_len=VIR_SEQ_LEN, 
+            depth=depth, 
+            mol_seq_len=MOL_SEQ_LEN, 
+            heads=heads, 
+            n_hashes=n_hashes,
+            ff_chunks=ff_chunks, 
+            attn_chunks=attn_chunks, 
+            cmd_args=cmd_args, 
+            output_folder=output_folder, 
+            train_batch_size=train_batch_size, 
+            epochs=epochs, 
+            train_dataset=train_dataset, 
+            test_dataset=test_dataset,
+            validate_every=VALIDATE_EVERY, 
+            save_every=SAVE_EVERY,
+            checkpoint_id=checkpoint_id
+        )
+    else:
+        test_encdec_v1(
+            input_lang=input_lang,
+            target_lang=target_lang, 
+            dim=dim, 
+            bucket_size=bucket_size, 
+            depth=depth, 
+            heads=heads, 
+            n_hashes=n_hashes, 
+            vir_seq_len=VIR_SEQ_LEN, 
+            ff_chunks=ff_chunks, 
+            attn_chunks=attn_chunks,
+            mol_seq_len=MOL_SEQ_LEN, 
+            cmd_args=cmd_args, 
+            train_dataset=train_dataset, 
+            test_dataset=test_dataset, 
+            output_folder=output_folder, 
+            train_batch_size=train_batch_size,
+            epochs=epochs,
+            validate_every=VALIDATE_EVERY, 
+            save_every=SAVE_EVERY,
+            checkpoint_id=checkpoint_id
+        )
+
+
+    # _, encoder_client_sd = encoder_engine.load_checkpoint(os.sep.join([training_folder, 'saved_model','encoder']), checkpoint_id)
+    # _, decoder_client_sd = decoder_engine.load_checkpoint(os.sep.join([training_folder, 'saved_model','decoder']), checkpoint_id) 
+
+    # #encoder_optimizer = RangerLars(encoder.parameters()) 
+    # #decoder_optimizer = RangerLars(decoder.parameters()) 
+
+    # encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX)
+    # decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX)
+
+    # encoder.load_state_dict(torch.load(encoder_checkpoint, map_location=torch.device(device))['module'])
+    # decoder.load_state_dict(torch.load(decoder_checkpoint, map_location=torch.device(device))['module'])
+
+    # enc_params_size_trainable = sum([np.prod(p.size()) for p in filter(lambda p: p.requires_grad, encoder.parameters())])
+    # dec_params_size_trainable = sum([np.prod(p.size()) for p in filter(lambda p: p.requires_grad, decoder.parameters())])
+
+    # enc_params_size = sum([np.prod(p.size()) for p in encoder.parameters()])
+    # dec_params_size = sum([np.prod(p.size()) for p in decoder.parameters()])
+
+    # print('Total parameters:', enc_params_size+dec_params_size)
+    # print('Total trainable parameters:', enc_params_size_trainable+dec_params_size_trainable)
+
+    # # for pair in tqdm(test_dataset):
+    # #     encoder.eval()
+    # #     decoder.eval()
+    # #     with torch.no_grad():
+    # #         ts_src = torch.tensor(np.array([pair[0].numpy()])).to(device)
+    # #         ts_trg = torch.tensor(np.array([pair[1].numpy()])).to(device)
+    # #         enc_keys = encoder(ts_src)
+    # #         yi = torch.tensor([[SOS_token]]).long().to(device) # assume you are sampling batch size of 2, start tokens are id of 0
+    # #         sample = decoder.generate(yi, MOL_SEQ_LEN, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token) # (2, <= 1024)
+    # #         actual_mol = ''
+    # #         for mol_seq in sample.cpu().numpy():
+    # #             for mol_idx in mol_seq:
+    # #                 actual_mol += target_lang.index2word[mol_idx]
+    # #             print('Generated Seq:', sample)
+    # #             print('Generated Mol:', actual_mol)
+    # #             print('Real Mol:', [target_lang.index2word[mol_idx] for mol_idx in pair[1]])
 
 
 
 
-val_loss = []
+    # val_loss = []
 
-for pair in tqdm(test_dataset):
-    encoder.eval()
-    decoder.eval()
-    with torch.no_grad():
-        ts_src = torch.tensor(np.array([pair[0].numpy()])).to(device)
-        ts_trg = torch.tensor(np.array([pair[1].numpy()])).to(device)
-        enc_keys = encoder(ts_src)
-        loss = decoder(ts_trg, keys=enc_keys, return_loss = True)
-        val_loss.append(loss.item())
-        print('Loss:', loss.item())
+    # for pair in tqdm(test_dataset):
+    #     encoder.eval()
+    #     decoder.eval()
+    #     with torch.no_grad():
+    #         ts_src = torch.tensor(np.array([pair[0].numpy()])).to(device)
+    #         ts_trg = torch.tensor(np.array([pair[1].numpy()])).to(device)
+    #         enc_keys = encoder(ts_src)
+    #         loss = decoder(ts_trg, keys=enc_keys, return_loss = True)
+    #         val_loss.append(loss.item())
+    #         print('Loss:', loss.item())
 
-print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
+    # print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
 
 
-## ENC DEC Evaluation
-## evaluate with the following
+    ## ENC DEC Evaluation
+    ## evaluate with the following
 
-# eval_seq_in = torch.randint(0, 20000, (1, DE_SEQ_LEN)).long().cuda()
-# eval_seq_out_start = torch.tensor([[0.]]).long().cuda() # assume 0 is id of start token
-# samples = enc_dec.generate(eval_seq_in, eval_seq_out_start, seq_len = EN_SEQ_LEN, eos_token = 1) # assume 1 is id of stop token
-# print(samples.shape) # (1, <= 1024) decode the tokens
+    # eval_seq_in = torch.randint(0, 20000, (1, DE_SEQ_LEN)).long().cuda()
+    # eval_seq_out_start = torch.tensor([[0.]]).long().cuda() # assume 0 is id of start token
+    # samples = enc_dec.generate(eval_seq_in, eval_seq_out_start, seq_len = EN_SEQ_LEN, eos_token = 1) # assume 1 is id of stop token
+    # print(samples.shape) # (1, <= 1024) decode the tokens
 
-# encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
-# decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
+    # encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
+    # decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
 
-# encoder_engine, encoder_optimizer, _, _ = deepspeed.initialize(args=cmd_args, model=encoder, optimizer=encoder_optimizer, model_parameters=encoder_params, dist_init_required=True)
-# decoder_engine, decoder_optimizer, _, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, model_parameters=encoder_params, dist_init_required=False)
+    # encoder_engine, encoder_optimizer, _, _ = deepspeed.initialize(args=cmd_args, model=encoder, optimizer=encoder_optimizer, model_parameters=encoder_params, dist_init_required=True)
+    # decoder_engine, decoder_optimizer, _, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, model_parameters=encoder_params, dist_init_required=False)
 
-# # training
-# SAVE_DIR = './saved_model/'
+    # # training
+    # SAVE_DIR = './saved_model/'
 
-# try:
-#     enc_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'encoder/')])
-# except Exception as e:
-#     print('Exception:', e)
-#     enc_ckp_max = 0
+    # try:
+    #     enc_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'encoder/')])
+    # except Exception as e:
+    #     print('Exception:', e)
+    #     enc_ckp_max = 0
 
-# try:
-#     dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'decoder/')])
-# except:
-#     dec_ckp_max = 0
+    # try:
+    #     dec_ckp_max = np.max([int(ckp) for ckp in os.listdir(SAVE_DIR+'decoder/')])
+    # except:
+    #     dec_ckp_max = 0
 
-# _, encoder_client_sd = encoder_engine.load_checkpoint(SAVE_DIR+'encoder/', enc_ckp_max)
-# _, decoder_client_sd = decoder_engine.load_checkpoint(SAVE_DIR+'decoder/', dec_ckp_max) #args
+    # _, encoder_client_sd = encoder_engine.load_checkpoint(SAVE_DIR+'encoder/', enc_ckp_max)
+    # _, decoder_client_sd = decoder_engine.load_checkpoint(SAVE_DIR+'decoder/', dec_ckp_max) #args
 
-# torch.save(decoder.state_dict(), f'./decoder.save.pt')
-# torch.save(encoder.state_dict(), f'./encoder.save.pt')
+    # torch.save(decoder.state_dict(), f'./decoder.save.pt')
+    # torch.save(encoder.state_dict(), f'./encoder.save.pt')
 
+if __name__ == "__main__":
+    main()
 
