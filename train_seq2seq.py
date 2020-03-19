@@ -1,5 +1,9 @@
 import torch
-from reformer_pytorch import ReformerEncDec, ReformerLM
+try:
+    from reformer_pytorch import ReformerEncDec
+except:
+    print('ReformerEndDec not found in current version of reformer_pytorch')
+from reformer_pytorch import ReformerLM
 from reformer_pytorch.generative_tools import TrainingWrapper
 import torch.optim as optim
 import torch.nn as nn
@@ -24,9 +28,40 @@ import json
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
 
+def compute_axial_position_shape(seq_len):
+    import math
+    def highestPowerof2(n): 
+        res = 0; 
+        for i in range(n, 0, -1): 
+            
+            # If i is a power of 2 
+            if ((i & (i - 1)) == 0): 
+            
+                res = i; 
+                break; 
+            
+        return res; 
+
+    def next_power_of_2(x):   
+        return 1 if x == 0 else 2**(x - 1).bit_length() 
+    
+    base_n = int(math.sqrt(seq_len))
+
+    first_component = next_power_of_2(base_n)
+    second_component = highestPowerof2(base_n)
+
+    if (first_component*second_component) != seq_len:
+        second_component = 2
+        first_component = int(seq_len/second_component)
+        
+    return (first_component, second_component)
+
+
 def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_hashes, vir_seq_len, ff_chunks, attn_chunks,
                     mol_seq_len, cmd_args, train_dataset, test_dataset, output_folder, train_batch_size, epochs,
                     validate_every, save_every, zero_optimization):
+    print('Axial Embedding shape:', compute_axial_position_shape(vir_seq_len)
+    )
     encoder = ReformerLM(
         num_tokens = input_lang.n_words,
         dim = dim,
@@ -40,7 +75,7 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
         weight_tie = True,
         weight_tie_embedding = True,
         axial_position_emb = True,
-        axial_position_shape = (256, 128),  
+        axial_position_shape = compute_axial_position_shape(vir_seq_len),  
         axial_position_dims = (int(dim/2), int(dim/2)),  
         return_embeddings = True 
     ).to(device)
@@ -56,7 +91,7 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
         attn_chunks = attn_chunks, 
         max_seq_len = mol_seq_len,
         axial_position_emb = True,
-        axial_position_shape = (64, 32),  
+        axial_position_shape = compute_axial_position_shape(mol_seq_len),  
         axial_position_dims = (int(dim/2), int(dim/2)), 
         weight_tie = True,
         weight_tie_embedding = True,
@@ -66,9 +101,9 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
     encoder_optimizer = RangerLars(encoder.parameters()) 
     decoder_optimizer = RangerLars(decoder.parameters()) 
     
-    if zero_optimization:
-        encoder_optimizer = deepspeed.pt.deepspeed_zero_optimizer.FP16_DeepSpeedZeroOptimizer(encoder_optimizer)
-        decoder_optimizer = deepspeed.pt.deepspeed_zero_optimizer.FP16_DeepSpeedZeroOptimizer(decoder_optimizer)
+    #if zero_optimization:
+    #    encoder_optimizer = deepspeed.pt.deepspeed_zero_optimizer.FP16_DeepSpeedZeroOptimizer(encoder_optimizer)
+    #    decoder_optimizer = deepspeed.pt.deepspeed_zero_optimizer.FP16_DeepSpeedZeroOptimizer(decoder_optimizer)
 
     encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
     decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
@@ -196,7 +231,7 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
         weight_tie = True,
         weight_tie_embedding = True,
         axial_position_emb = True,
-        axial_position_shape = (256, 128),  
+        axial_position_shape = compute_axial_position_shape(vir_seq_len),  
         axial_position_dims = (int(dim/2), int(dim/2)),  
 
     ).to(device)
