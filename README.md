@@ -39,31 +39,59 @@ The input dataset containing the relations between Virus and Anti-Viral molecule
 genome nomenclatures I found in the ViralGenomes DB so by using a genome-browser I managed to curate it.
 The instruction to download the curated file are in the `DatasetCreation.ipynb` notebook.
 
+Premade Genome to SMILE files can be found here:
+- Training: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol_tr.csv
+- Testing: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol_ts.csv
+- Validation: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol_val.csv
+- Complete Dataset: https://storage.googleapis.com/bioshield-bucket/bioshield/gen_to_mol.csv
+
 ## Reformer Model Enc-Dec for Seq2Seq Model
 
 The idea behind the model is to use NeuralMachineTranslation model to "translate" the viral genome into the target
 molecule. Since our main target up to now is COVID-19 we need an Encoder-Decoder that can take up to 30k sequence length
-as input. This can be achieved only by using Reformer: The Efficient Transformer. The tentative training of this architecture can be found in the file `train_model_torch.py`
+as input. This can be achieved only by using Reformer: The Efficient Transformer. The tentative training of this architecture can be found in the file `train_seq2seq.py`
 
 ### Training the model
 
 After executing the first part of `DataCreation.ipynb` you would have the file `gen_to_mol_tr.csv` and `gen_to_mol_ts.csv` in the root of the project.
-The model is being training using `DeepSpeed` on a workstation with the following specs:
-- 8 vCPU
-- 30GB RAM
-- 2xP100 16GB RAM
 
 The configurations can be found in `ds_config.json` . The trained model has 24 layers in total, 12 for the Encoder and 12 for the Decoder. The hidden layers dimension is 768 neurons, and take advantage of some tricks found in the Reformer Pytorch implementation like `Axial Embeddings` that works well with long sequences, and in order to reduce the memory impact `weight_tie` has been setted to `true` both for the layers weights as well as for the embeddings ones.
 For the same memory reason, the `ff_chunks` and the `attn_chunks` options has been used in order to feed in chunks the data in the model.
 
-The optimizer chosen was the Over9000 implementation of `RangersLars` (more infor at https://github.com/mgrankin/over9000). Currently the activation function used is the default one, which is GLUE, but in the next training I will use `MISH` (more infor at https://github.com/digantamisra98/Mish).
+The optimizer chosen was the Over9000 implementation of `RangersLars` (more info at https://github.com/mgrankin/over9000). Currently the activation function used is the default one, which is `GLUE`, but in the next training I will use `MISH` (more info at https://github.com/digantamisra98/Mish).
+
+#### First Attempt
+The model is being training using `DeepSpeed` on a workstation with the following specs:
+- 8 vCPU
+- 30GB RAM
+- 2xP100 16GB RAM
 
 This first training has been performed using only the first 50000 samples of the dataset. Full training will be performed on a much more powerful machine with 4x or 8x V100. Since in this initial try we have only 2 GPUs I choose 4 samples for each batch in order to parallelize them in 2 per GPU.
 
 The testing process has been performed for 100 samples, in this initial tryout setup, every 100 training steps. In the final run the testing will be performed on the whole dataset. This training has the purpose to understand if the setup works from an architectural point of view, and if the results could start to make sense.
 
 In order to run the training run the following command:
-- `deepspeed train_model_torch.py --dim 768 --bucket_size 64 --depth 12 --deepspeed --deepspeed_config ds_config.json --num_examples_tr 50000 --num_examples_ts 100 --ff_chunks 200 --attn_chunks 8 --validate_every 100 --save_every 100`
+- `deepspeed train_seq2seq.py --dim 768 --bucket_size 64 --depth 12 --deepspeed --deepspeed_config ds_config.json --num_examples_tr 50000 --num_examples_ts 100 --ff_chunks 200 --attn_chunks 8 --validate_every 100 --save_every 100`
+
+The first 50K trained EncoderDecoder model can be found here:
+- https://storage.googleapis.com/bioshield-bucket/bioshield/first_50k_train.zip
+
+*Outcome:* It seems promising, let's do a more robust training with 8xV100 and 100k samples
+
+#### Second Attempt
+The model is being training using `DeepSpeed` on a workstation with the following specs:
+- 32 vCPU
+- 208 GB RAM
+- 8xV100 16GB RAM
+- Training: 100k samples
+- Test: 1k samples
+- DeepSpeed conf: ds_config_ov9k.json
+- Command to train: `deepspeed train_seq2seq.py --dim 512 --bucket_size 64 --depth 12 --deepspeed --deepspeed_config ds_config_ov9k.json --num_examples_tr 100000 --num_examples_ts 1000 --ff_chunks 200 --attn_chunks 8 --validate_every 10 --save_every 10 --output_folder training_100k-1k_512H_12L_64bck_config_v0.19.5_ov9k_8xV100 --ds_conf ds_config_ov9k.json`
+- Command to test: `python test_seq2seq.py  --num_examples_ts 100 --training_folder ./training_100k-1k_512H_12L_64bck_config_v0.19.5_ov9k_8xV100/ --checkpoint_id 401`
+
+*Outcome:* 
+- No good. The training didn't went well. The model is not learning nothing even thought the loss is decreasing. There is an issue in `reformer_pytorch` repository where this is better explained: https://github.com/lucidrains/reformer-pytorch/issues/69 and https://github.com/lucidrains/reformer-pytorch/issues/75
+- I will try using full attention mechanism, trying to address the memory issue by using a smaller network. It seems that ReformerLM is good for pre-training language models rather than create a full Encoder Decoder architecture.
 
 ### Validating the model
 
@@ -79,6 +107,9 @@ TIP: We might use https://github.com/gmum/MAT
 
 - Reformer Seq2Seq model for NMT
   - Implement Parallel Testing for the Seq2Seq model
+  - Implement MISH option
+    - Add MISH and MISH Cuda to automatically switch according device
+  - Implement DeepSpeed evaluation script that actually generates Canonical SMILES
 - SMILE Similarity Model for molecular similarity
 
 ## Disclamier
@@ -86,6 +117,9 @@ TIP: We might use https://github.com/gmum/MAT
 This is a work in progress, I'll surely do some mistakes or miss something. I'm sharing all my progress in real time in order to enable anyone who want to help starting from the very last update. Please let me know any issues you find in the processes, the ideas and/or the code I wrote. Contribute if you want. The main goal of this repo is trying to help during this Covid-19 pandemy. 
 
 ## Credits
+
+DeepSpeed by Microsoft:
+- https://github.com/microsoft/DeepSpeed
 
 Optimizer by: Over9000: 
 - https://github.com/mgrankin/over9000
@@ -97,4 +131,9 @@ MISH:
 
 Refomer:
 - https://github.com/lucidrains/reformer-pytorch
+
+
+******
+If this repo has been useful for your researches, please cite it :) It will be much appriciated.
+Cal
 
