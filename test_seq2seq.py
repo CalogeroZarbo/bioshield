@@ -10,6 +10,9 @@ import pickle
 from utils import *
 import argparse
 import deepspeed
+import json
+from torch.utils.data import DataLoader
+import torch.nn as nn
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
@@ -24,7 +27,8 @@ def convert_ds_chkpt(ds_chkpt, device):
 
 def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_hashes, vir_seq_len, ff_chunks, attn_chunks,
                     mol_seq_len, cmd_args, train_dataset, test_dataset, output_folder, train_batch_size, epochs,
-                    validate_every, save_every, checkpoint_id):
+                    validate_every, save_every, checkpoint_id, deepspeed_optimizer, use_full_attn, gradient_accumulation_steps,
+                    filter_thres):
     results = {
         'generated_seq':[],
         'generated_mol':[],
@@ -45,9 +49,10 @@ def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_ha
         weight_tie = True,
         weight_tie_embedding = True,
         axial_position_emb = True,
-        axial_position_shape = (256, 128),  
-        axial_position_dims = (int(dim/2), int(dim/2)),  
-        return_embeddings = True 
+        axial_position_shape = compute_axial_position_shape(vir_seq_len),
+        axial_position_dims = (dim // 2, dim //2),
+        return_embeddings = True,
+        use_full_attn = use_full_attn
     ).to(device)
 
     decoder = ReformerLM(
@@ -61,27 +66,14 @@ def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_ha
         attn_chunks = attn_chunks, 
         max_seq_len = mol_seq_len,
         axial_position_emb = True,
-        axial_position_shape = (64, 32),  
-        axial_position_dims = (int(dim/2), int(dim/2)), 
+        axial_position_shape = compute_axial_position_shape(mol_seq_len),  
+        axial_position_dims = (dim // 2, dim //2), 
         weight_tie = True,
         weight_tie_embedding = True,
-        causal = True
+        causal = True,
+        use_full_attn = use_full_attn
     ).to(device)
 
-    encoder_optimizer = RangerLars(encoder.parameters()) 
-    decoder_optimizer = RangerLars(decoder.parameters()) 
-    
-
-    encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
-    decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
-    
-    '''
-    encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
-    decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
-
-    encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=encoder, optimizer=encoder_optimizer, model_parameters=encoder_params, training_data=train_dataset, dist_init_required=True)
-    decoder_engine, decoder_optimizer, testloader, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, model_parameters=encoder_params, training_data=test_dataset, dist_init_required=False)
-    
     SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
 
     if checkpoint_id:
@@ -99,14 +91,51 @@ def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_ha
         except:
             dec_ckp_max = 0
 
+    encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
+    decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
+
+    '''
+    encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
+    decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
+
+    if deepspeed_optimizer == False:
+        print('No DeepSpeed optimizer found. Using RangerLars.')
+        encoder_optimizer = RangerLars(encoder.parameters()) 
+        decoder_optimizer = RangerLars(decoder.parameters()) 
+
+        encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(
+            args=cmd_args, 
+            model=encoder, 
+            optimizer=encoder_optimizer, 
+            model_parameters=encoder_params, 
+            training_data=train_dataset, 
+            dist_init_required=True
+            )
+
+        decoder_engine, decoder_optimizer, testloader, _ = deepspeed.initialize(
+            args=cmd_args, 
+            model=decoder, 
+            optimizer=decoder_optimizer, 
+            model_parameters=decoder_params, 
+            training_data=test_dataset, 
+            dist_init_required=False
+            )
+    else:
+        print('Found optimizer in the DeepSpeed configurations. Using it.')
+        encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=encoder, model_parameters=encoder_params, training_data=train_dataset, dist_init_required=True)
+        decoder_engine, decoder_optimizer, testloader, _ = deepspeed.initialize(args=cmd_args, model=decoder, model_parameters=decoder_params, training_data=test_dataset, dist_init_required=False)
+       
     _, encoder_client_sd = encoder_engine.load_checkpoint(os.sep.join([SAVE_DIR,'encoder']), enc_ckp_max)
     _, decoder_client_sd = decoder_engine.load_checkpoint(os.sep.join([SAVE_DIR,'decoder']), dec_ckp_max) 
 
-    gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
+    gpus_mini_batch = (train_batch_size// gradient_accumulation_steps) // torch.cuda.device_count()
+    print('gpus_mini_batch:', gpus_mini_batch, 'with gradient_accumulation_steps:', gradient_accumulation_steps)
     
-    for pair in testloader:
+    for pair in tqdm(testloader):
         encoder_engine.eval()
         decoder_engine.eval()
+        encoder.eval()
+        decoder.eval()
         with torch.no_grad():
             ts_src = pair[0]
             ts_trg = pair[1]
@@ -114,20 +143,24 @@ def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_ha
             input_genome = [[input_lang.index2word[gen_idx.item()] for gen_idx in smpl] for smpl in pair[0]]            
             target_mol = [[target_lang.index2word[mol_idx.item()] for mol_idx in smpl] for smpl in pair[1]]
             
-            ts_src= ts_src.to(encoder_engine.local_rank)
-            ts_trg = ts_trg.to(decoder_engine.local_rank)
+            ts_src = ts_src.to(encoder_engine.local_rank) #ts_src.to(device) #
+            ts_trg = ts_trg.to(decoder_engine.local_rank) #ts_trg.to(device) #
 
-            enc_keys = encoder_engine(ts_src)
-            yi = torch.tensor([[SOS_token] for _ in range(gpus_mini_batch)]).long().to(decoder_engine.local_rank) 
+            print('ts_src.shape', ts_src.shape)
+            print('ts_src.shape', ts_trg.shape)
+
+            enc_keys = encoder(ts_src) #encoder_engine(ts_src)
+            yi = torch.tensor([[SOS_token] for _ in range(gpus_mini_batch)]).long().to(decoder_engine.local_rank) #to(device) #
             
-            sample = decoder_engine.generate(yi, mol_seq_len, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token)
-            actual_mol = ''
+            #sample = decoder_engine.generate(yi, mol_seq_len, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token)
+            sample = decoder.generate(yi, mol_seq_len, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token)
+            actual_mol = []
             for mol_seq in sample.cpu().numpy():
                 for mol_idx in mol_seq:
-                    actual_mol += target_lang.index2word[mol_idx]
+                    actual_mol.append(target_lang.index2word[mol_idx])
                 print('Generated Seq:', sample)
                 print('Generated Mol:', actual_mol)
-                print('Real Mol:', target_mol)
+                print('Real Mol:', target_mol[:target_mol.index(target_lang.index2word[EOS_token])])
 
                 results['generated_seq'].append(sample)
                 results['generated_mol'].append(actual_mol)
@@ -138,13 +171,25 @@ def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_ha
     pickle.dump(results, open(os.sep.join([output_folder,'test_results.pkl']), 'wb'))
     '''
 
-    encoder_checkpoint = os.sep.join([output_folder, 'saved_model', 'encoder', checkpoint_id, 'mp_rank_00_model_states.pt'])
-    decoder_checkpoint = os.sep.join([output_folder, 'saved_model', 'decoder', checkpoint_id, 'mp_rank_00_model_states.pt'])
+    encoder_checkpoint = os.sep.join([output_folder, 'saved_model', 'encoder', enc_ckp_max, 'mp_rank_00_model_states.pt'])
+    decoder_checkpoint = os.sep.join([output_folder, 'saved_model', 'decoder', dec_ckp_max, 'mp_rank_00_model_states.pt'])
     
     encoder.load_state_dict(torch.load(encoder_checkpoint, map_location=torch.device(device))['module'])
     decoder.load_state_dict(torch.load(decoder_checkpoint, map_location=torch.device(device))['module'])
 
-    for pair in test_dataset:
+    real_batch_size = train_batch_size // gradient_accumulation_steps
+    test_loader = DataLoader(dataset=test_dataset, batch_size=real_batch_size, shuffle=True)
+
+    if torch.cuda.device_count() > 1:
+        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        # dim = 0 [30, xxx] -> [10, ...], [10, ...], [10, ...] on 3 GPUs
+        encoder = nn.DataParallel(encoder)
+        decoder = nn.DataParallel(decoder)
+
+    encoder.to(device)
+    decoder.to(device)
+
+    for pair in tqdm(test_loader):
         encoder.eval()
         decoder.eval()
         with torch.no_grad():
@@ -157,14 +202,14 @@ def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_ha
             enc_keys = encoder(ts_src)
             yi = torch.tensor([[SOS_token]]).long().to(device) 
             
-            sample = decoder.generate(yi, mol_seq_len, filter_logits_fn=top_p, filter_thres=0.95, keys=enc_keys, eos_token = EOS_token)
-            actual_mol = ''
+            sample = decoder.generate(yi, mol_seq_len, filter_logits_fn=top_p, filter_thres=filter_thres, keys=enc_keys, eos_token = EOS_token)
+            actual_mol = []
             for mol_seq in sample.cpu().numpy():
                 for mol_idx in mol_seq:
-                    actual_mol += target_lang.index2word[mol_idx]
+                    actual_mol.append(target_lang.index2word[mol_idx])
                 print('Generated Seq:', sample)
                 print('Generated Mol:', actual_mol)
-                print('Real Mol:', target_mol)
+                print('Real Mol:', target_mol[:target_mol.index(target_lang.index2word[EOS_token])])
 
                 results['generated_seq'].append(sample)
                 results['generated_mol'].append(actual_mol)
@@ -173,6 +218,7 @@ def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_ha
     
     print('Saving Test Results..')
     pickle.dump(results, open(os.sep.join([output_folder,'test_results.pkl']), 'wb'))
+    
 
     '''
     val_loss = []
@@ -193,7 +239,8 @@ def test_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_ha
 
 def test_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, depth, mol_seq_len, heads, n_hashes,
                     ff_chunks, attn_chunks, cmd_args, output_folder, train_batch_size, epochs, train_dataset, test_dataset,
-                    validate_every, save_every, checkpoint_id):
+                    validate_every, save_every, checkpoint_id, deepspeed_optimizer, use_full_attn, gradient_accumulation_steps,
+                    filter_thres):
     print('Not implemented yet.')
     pass
 
@@ -204,6 +251,7 @@ def main():
     parser.add_argument('--checkpoint_id', type=str, default='1',
                         help='the checkpoint id to restore')
     parser.add_argument('--num_examples_ts', type=int, default=1024, help='Max number of samples TS')
+    parser.add_argument('--filter_thres', type=float, default=0.95, help='Threshold to use when filtering generated tokens.')
     parser.add_argument('--local_rank', type=int, default=-1, help='local rank passed from distributed launcher')
 
     parser = deepspeed.add_config_arguments(parser)
@@ -211,6 +259,7 @@ def main():
 
     training_folder = args.training_folder
     checkpoint_id = args.checkpoint_id
+    filter_thres = args.filter_thres
 
     cmd_args = pickle.load(open(os.sep.join([training_folder,'training_conf.pkl']), 'rb'))
 
@@ -224,7 +273,8 @@ def main():
     max_len_mol = cmd_args.max_len_mol
     #num_examples_tr = cmd_args.num_examples_tr
     num_examples_ts = args.num_examples_ts
-    train_batch_size = cmd_args.train_batch_size
+    train_batch_size = json.load(open(cmd_args.ds_conf))['train_batch_size']#cmd_args.train_batch_size
+    gradient_accumulation_steps = json.load(open(cmd_args.ds_conf))['gradient_accumulation_steps']
     epochs = cmd_args.epochs
     emb_dim = cmd_args.emb_dim
     dim = cmd_args.dim
@@ -238,6 +288,9 @@ def main():
     save_every = cmd_args.save_every
     output_folder = cmd_args.output_folder
     use_encdec_v2 = cmd_args.use_encdec_v2
+    use_full_attn = cmd_args.use_full_attn
+
+    deepspeed_optimizer = True if json.load(open(cmd_args.ds_conf)).get('optimizer', None) is not None else False
 
     MAX_LENGTH_GEN = max_len_gen # 32768
     MIN_LENGTH_GEN = min_len_gen
@@ -287,7 +340,11 @@ def main():
             test_dataset=test_dataset,
             validate_every=VALIDATE_EVERY, 
             save_every=SAVE_EVERY,
-            checkpoint_id=checkpoint_id
+            checkpoint_id=checkpoint_id,
+            deepspeed_optimizer=deepspeed_optimizer,
+            use_full_attn=use_full_attn,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            filter_thres=filter_thres
         )
     else:
         test_encdec_v1(
@@ -310,7 +367,11 @@ def main():
             epochs=epochs,
             validate_every=VALIDATE_EVERY, 
             save_every=SAVE_EVERY,
-            checkpoint_id=checkpoint_id
+            checkpoint_id=checkpoint_id,
+            deepspeed_optimizer=deepspeed_optimizer,
+            use_full_attn=use_full_attn,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            filter_thres=filter_thres
         )
 
 

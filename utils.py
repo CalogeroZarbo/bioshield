@@ -9,6 +9,34 @@ PAD_IDX = 0
 SOS_token = 1
 EOS_token = 2
 
+def compute_axial_position_shape(seq_len):
+    import math
+    def highestPowerof2(n): 
+        res = 0; 
+        for i in range(n, 0, -1): 
+            
+            # If i is a power of 2 
+            if ((i & (i - 1)) == 0): 
+            
+                res = i; 
+                break; 
+            
+        return res; 
+
+    def next_power_of_2(x):   
+        return 1 if x == 0 else 2**(x - 1).bit_length() 
+    
+    base_n = int(math.sqrt(seq_len))
+
+    first_component = next_power_of_2(base_n)
+    second_component = highestPowerof2(base_n)
+
+    if (first_component*second_component) != seq_len:
+        second_component = 2
+        first_component = int(seq_len/second_component)
+        
+    return (first_component, second_component)
+
 class Lang:
     def __init__(self, name):
         self.name = name
@@ -59,15 +87,19 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
             if num_examples_tr > 0:
                 if len(tr_pairs) == num_examples_tr:
                     break
-            gen_code = row[1]#['genetic_code']
-            can_sml = row[3]#['canonical_smiles']
+            gen_code = row[header.index('genetic_code')]#['genetic_code'] --> 1
+            can_sml = row[header.index('canonical_smiles')]#['canonical_smiles'] --> 3
+
+            if max_len_molecule > 0:
+                if len(can_sml) > max_len_molecule:
+                    continue
 
             if min_len_genome > 0:
                 if len(gen_code) < min_len_genome:
                     continue
 
             if max_len_genome > 0:
-                if len(gen_code) < max_len_genome:
+                if len(gen_code) <= max_len_genome-2:# -2 is for SOS and EOS
                     # Split line into pairs and normalize
                     tr_pairs.append([preprocess_sentence(gen_code, max_len_genome), preprocess_sentence(can_sml, max_len_molecule)])
             else:
@@ -85,11 +117,19 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
             if num_examples_ts > 0:
                 if len(ts_pairs) == num_examples_ts:
                     break
-            gen_code = row[1]#['genetic_code']
-            can_sml = row[3]#['canonical_smiles']
+            gen_code = row[header.index('genetic_code')]#['genetic_code'] --> 1
+            can_sml = row[header.index('canonical_smiles')]#['canonical_smiles'] --> 3
+
+            if max_len_molecule > 0:
+                if len(can_sml) > max_len_molecule:
+                    continue
+
+            if min_len_genome > 0:
+                if len(gen_code) < min_len_genome:
+                    continue
 
             if max_len_genome > 0:
-                if len(gen_code) < max_len_genome:
+                if len(gen_code) <= max_len_genome-2: # -2 is for SOS and EOS
                     # Split line into pairs and normalize
                     ts_pairs.append([preprocess_sentence(gen_code, max_len_genome), preprocess_sentence(can_sml, max_len_molecule)])
             else:
@@ -132,8 +172,8 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
         print('input tokens', input_lang.n_words)
         print('target_lang',output_lang.n_words)
     else:
-        input_lang = Lang(lang2)
-        output_lang = Lang(lang1)
+        input_lang = Lang(lang1)
+        output_lang = Lang(lang2)
 
 
     for pair in tr_pairs:

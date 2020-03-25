@@ -28,38 +28,9 @@ import json
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device for Training:', device)
 
-def compute_axial_position_shape(seq_len):
-    import math
-    def highestPowerof2(n): 
-        res = 0; 
-        for i in range(n, 0, -1): 
-            
-            # If i is a power of 2 
-            if ((i & (i - 1)) == 0): 
-            
-                res = i; 
-                break; 
-            
-        return res; 
-
-    def next_power_of_2(x):   
-        return 1 if x == 0 else 2**(x - 1).bit_length() 
-    
-    base_n = int(math.sqrt(seq_len))
-
-    first_component = next_power_of_2(base_n)
-    second_component = highestPowerof2(base_n)
-
-    if (first_component*second_component) != seq_len:
-        second_component = 2
-        first_component = int(seq_len/second_component)
-        
-    return (first_component, second_component)
-
-
 def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_hashes, vir_seq_len, ff_chunks, attn_chunks,
                     mol_seq_len, cmd_args, train_dataset, test_dataset, output_folder, train_batch_size, epochs,
-                    validate_every, save_every, zero_optimization):
+                    validate_every, save_every, deepspeed_optimizer, use_full_attn, gradient_accumulation_steps): #zero_optimization, #unused for now. Use this flag to create IF statement for Zero Compatibility if needed
     print('Axial Embedding shape:', compute_axial_position_shape(vir_seq_len)
     )
     encoder = ReformerLM(
@@ -76,8 +47,9 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
         weight_tie_embedding = True,
         axial_position_emb = True,
         axial_position_shape = compute_axial_position_shape(vir_seq_len),  
-        axial_position_dims = (int(dim/2), int(dim/2)),  
-        return_embeddings = True 
+        axial_position_dims = (dim // 2, dim //2),  
+        return_embeddings = True,
+        use_full_attn = use_full_attn
     ).to(device)
 
     decoder = ReformerLM(
@@ -92,32 +64,47 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
         max_seq_len = mol_seq_len,
         axial_position_emb = True,
         axial_position_shape = compute_axial_position_shape(mol_seq_len),  
-        axial_position_dims = (int(dim/2), int(dim/2)), 
+        axial_position_dims = (dim // 2, dim //2), 
         weight_tie = True,
         weight_tie_embedding = True,
-        causal = True
+        causal = True,
+        use_full_attn = use_full_attn
     ).to(device)
-
-    encoder_optimizer = RangerLars(encoder.parameters()) 
-    decoder_optimizer = RangerLars(decoder.parameters()) 
-    
-    #if zero_optimization:
-    #    encoder_optimizer = deepspeed.pt.deepspeed_zero_optimizer.FP16_DeepSpeedZeroOptimizer(encoder_optimizer)
-    #    decoder_optimizer = deepspeed.pt.deepspeed_zero_optimizer.FP16_DeepSpeedZeroOptimizer(decoder_optimizer)
 
     encoder = TrainingWrapper(encoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
     decoder = TrainingWrapper(decoder, ignore_index=PAD_IDX, pad_value=PAD_IDX).to(device)
-    
 
     encoder_params = filter(lambda p: p.requires_grad, encoder.parameters())
     decoder_params = filter(lambda p: p.requires_grad, decoder.parameters())
 
-    encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=encoder, optimizer=encoder_optimizer, model_parameters=encoder_params, training_data=train_dataset, dist_init_required=True)
-    decoder_engine, decoder_optimizer, _, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, model_parameters=encoder_params, dist_init_required=False)
-    
-    _, _, testloader, _ = deepspeed.initialize(args=cmd_args, model=decoder, optimizer=decoder_optimizer, training_data=test_dataset)
-   
+    if deepspeed_optimizer == False:
+        print('No DeepSpeed optimizer found. Using RangerLars.')
+        encoder_optimizer = RangerLars(encoder.parameters()) 
+        decoder_optimizer = RangerLars(decoder.parameters()) 
 
+        encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(
+            args=cmd_args, 
+            model=encoder, 
+            optimizer=encoder_optimizer, 
+            model_parameters=encoder_params, 
+            training_data=train_dataset, 
+            dist_init_required=True
+            )
+
+        decoder_engine, decoder_optimizer, testloader, _ = deepspeed.initialize(
+            args=cmd_args, 
+            model=decoder, 
+            optimizer=decoder_optimizer, 
+            model_parameters=decoder_params, 
+            training_data=test_dataset, 
+            dist_init_required=False
+            )
+    else:
+        print('Found optimizer in the DeepSpeed configurations. Using it.')
+        encoder_engine, encoder_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=encoder, model_parameters=encoder_params, training_data=train_dataset, dist_init_required=True)
+        decoder_engine, decoder_optimizer, testloader, _ = deepspeed.initialize(args=cmd_args, model=decoder, model_parameters=decoder_params, training_data=test_dataset, dist_init_required=False)
+    
+    
     SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -135,15 +122,16 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
     _, encoder_client_sd = encoder_engine.load_checkpoint(os.sep.join([SAVE_DIR,'encoder']), enc_ckp_max)
     _, decoder_client_sd = decoder_engine.load_checkpoint(os.sep.join([SAVE_DIR,'decoder']), dec_ckp_max) 
 
-    gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
-    print('gpus_mini_batch:', gpus_mini_batch)
+    gpus_mini_batch = (train_batch_size// gradient_accumulation_steps) // torch.cuda.device_count()
+    print('gpus_mini_batch:', gpus_mini_batch, 'with gradient_accumulation_steps:', gradient_accumulation_steps)
+
     log_file = open(os.sep.join([output_folder,'training_log.log']), 'a')
     log_file.write("\n\n\n{}\tStarting new training from chekpoint: Encoder-{} | Decoder-{}\n".format(datetime.datetime.now(), enc_ckp_max, dec_ckp_max))
     log_file.flush()
 
     for eph in range(epochs):
         print('Starting Epoch: {}'.format(eph))
-        for i, pair in enumerate(trainloader):
+        for i, pair in enumerate(tqdm(trainloader)):
             tr_step = ((eph*len(trainloader))+i)+1
 
             src = pair[0]
@@ -154,7 +142,7 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
             trg = trg.to(decoder_engine.local_rank)
 
             enc_keys = encoder_engine(src)
-            loss = decoder_engine(trg, keys = enc_keys, return_loss = True)   # (1, 4096, 20000)
+            loss = decoder_engine(trg, keys = enc_keys, return_loss = True)  
             loss.backward()
 
             decoder_engine.step()
@@ -205,7 +193,7 @@ def train_encdec_v1(input_lang, target_lang, dim, bucket_size, depth, heads, n_h
 
 def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, depth, mol_seq_len, heads, n_hashes,
                     ff_chunks, attn_chunks, cmd_args, output_folder, train_batch_size, epochs, train_dataset, test_dataset,
-                    validate_every, save_every, zero_optimization):
+                    validate_every, save_every, deepspeed_optimizer, use_full_attn, gradient_accumulation_steps):#zero_optimization, #unused for now. Use this flag to create IF statement for Zero Compatibility if needed
     enc_dec = ReformerEncDec(
         dim = dim,
         bucket_size = bucket_size,
@@ -214,16 +202,19 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
         enc_max_seq_len = vir_seq_len,
         enc_depth = depth,
         enc_bucket_size = bucket_size, 
+        enc_use_full_attn = use_full_attn,
         return_embeddings = True,
 
         dec_num_tokens = target_lang.n_words,
         dec_max_seq_len = mol_seq_len,
         dec_depth = depth,
         dec_bucket_size = bucket_size,
+        dec_use_full_attn = use_full_attn,
         dec_causal = True,
         
         ignore_index = PAD_IDX,
-        pad_value = PAD_IDX,        
+        pad_value = PAD_IDX,
+
         heads = heads, 
         n_hashes= n_hashes,
         ff_chunks = ff_chunks,
@@ -232,18 +223,39 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
         weight_tie_embedding = True,
         axial_position_emb = True,
         axial_position_shape = compute_axial_position_shape(vir_seq_len),  
-        axial_position_dims = (int(dim/2), int(dim/2)),  
+        axial_position_dims = (dim // 2, dim //2),  
 
     ).to(device)
 
-    enc_dec_optimizer = RangerLars(enc_dec.parameters()) 
-
     enc_dec_params = filter(lambda p: p.requires_grad, enc_dec.parameters())
 
-    enc_dec_engine, enc_dec_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, optimizer=enc_dec_optimizer, model_parameters=enc_dec_params, training_data=train_dataset)
-    _, _, testloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, optimizer=enc_dec_optimizer, training_data=test_dataset)
-   
+    if deepspeed_optimizer == False:
+        print('No DeepSpeed optimizer found. Using RangerLars.')
+        enc_dec_optimizer = RangerLars(enc_dec.parameters()) 
 
+        enc_dec_engine, enc_dec_optimizer, trainloader, _ = deepspeed.initialize(
+            args=cmd_args, 
+            model=enc_dec, 
+            optimizer=enc_dec_optimizer, 
+            model_parameters=enc_dec_params, 
+            training_data=train_dataset
+            )
+        
+        testloader = enc_dec_engine.deepspeed_io(test_dataset)
+
+        # enc_dec_engine, enc_dec_optimizer, testloader, _ = deepspeed.initialize(
+        #     args=cmd_args, 
+        #     model=enc_dec, 
+        #     optimizer=enc_dec_optimizer, 
+        #     model_parameters=enc_dec_params, 
+        #     training_data=test_dataset
+        #     )
+        #_, _, testloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, optimizer=enc_dec_optimizer, training_data=test_dataset)
+    else:
+        print('Found optimizer in the DeepSpeed configurations. Using it.')
+        enc_dec_engine, enc_dec_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, model_parameters=enc_dec_params, training_data=train_dataset)
+        enc_dec_engine, enc_dec_optimizer, testloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, model_parameters=enc_dec_params, training_data=test_dataset)
+    
     # training
     SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -255,31 +267,35 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
 
     _, enc_dec_client_sd = enc_dec_engine.load_checkpoint(os.sep.join([SAVE_DIR,'enc_dec']), enc_dec_ckp_max) 
 
-    gpus_mini_batch = int(train_batch_size / torch.cuda.device_count())
-    print('gpus_mini_batch:', gpus_mini_batch)
+    gpus_mini_batch = (train_batch_size// gradient_accumulation_steps) // torch.cuda.device_count()
+    print('gpus_mini_batch:', gpus_mini_batch, 'with gradient_accumulation_steps:', gradient_accumulation_steps)
     log_file = open(os.sep.join([output_folder,'training_log.log']), 'a')
     log_file.write("\n\n\n{}\tStarting new training from chekpoint: EncoderDecoder-{}\n".format(datetime.datetime.now(), enc_dec_ckp_max))
     log_file.flush()
 
+    #testloader = DataLoader(dataset=test_dataset, batch_size=gpus_mini_batch, shuffle=True)
+
     for eph in range(epochs):
         print('Starting Epoch: {}'.format(eph))
-        for i, pair in enumerate(trainloader):
+        for i, pair in enumerate(tqdm(trainloader)):
             tr_step = ((eph*len(trainloader))+i)+1
 
             src = pair[0]
             trg = pair[1]
 
             enc_dec_engine.train()
+            enc_dec.train()
             
             src = src.to(enc_dec_engine.local_rank)
             trg = trg.to(enc_dec_engine.local_rank)
 
             ## Need to learn how to use masks correctly
-            # enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in src]).bool().to(device) 
+            enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in src]).bool().to(enc_dec_engine.local_rank) 
             # context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in trg]).bool().to(device)
             #################
 
-            loss = enc_dec(src, trg, return_loss = True, enc_input_mask = None)#enc_input_mask)#, context_mask=context_mask)
+            loss = enc_dec_engine(src, trg, return_loss = True, enc_input_mask = enc_input_mask)#enc_input_mask)#, context_mask=context_mask)
+            #loss = enc_dec(src, trg, return_loss = True, enc_input_mask = None)#enc_input_mask)#, context_mask=context_mask)
 
             loss.backward()
 
@@ -288,8 +304,9 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
             print('Training Loss:',loss.item())       
             if tr_step % validate_every == 0:
                 val_loss = []
-                for pair in tqdm(testloader):
+                for pair in tqdm(testloader): #Can't use the testloader or I will mess up with the model assignment and it won't learn during training, need to use normal validation instead of parallel one
                     enc_dec_engine.eval()
+                    #enc_dec.eval()
                     with torch.no_grad():
                         ts_src = pair[0]
                         ts_trg = pair[1]
@@ -297,11 +314,15 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
                         ts_src= ts_src.to(enc_dec_engine.local_rank)
                         ts_trg = ts_trg.to(enc_dec_engine.local_rank)
 
+                        #ts_src = torch.tensor(np.array([pair[0].numpy()])).to(device)
+                        #ts_trg = torch.tensor(np.array([pair[1].numpy()])).to(device)
+
                         ## Need to learn how to use masks correctly
-                        #ts_enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_src]).bool().to(device)
+                        ts_enc_input_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_src]).bool().to(enc_dec_engine.local_rank)
                         #ts_context_mask = torch.tensor([[1 for idx in smpl if idx != PAD_IDX] for smpl in ts_trg]).bool().to(device)
 
-                        loss = enc_dec(ts_src, ts_trg, return_loss = True, enc_input_mask = None)#ts_enc_input_mask)#, context_mask=ts_context_mask)
+                        loss = enc_dec_engine(ts_src, ts_trg, return_loss = True, enc_input_mask = ts_enc_input_mask)#ts_enc_input_mask)#, context_mask=ts_context_mask)
+                        #loss = enc_dec(ts_src, ts_trg, return_loss = True, enc_input_mask = None)
                         val_loss.append(loss.item())
 
                 print(f'\tValidation Loss: AVG: {np.mean(val_loss)}, MEDIAN: {np.median(val_loss)}, STD: {np.std(val_loss)} ')
@@ -361,9 +382,9 @@ def add_argument():
     parser.add_argument('--path_to_file_tr', default='./gen_to_mol_tr.csv', help='Trainig file') 
     parser.add_argument('--path_to_file_ts', default='./gen_to_mol_ts.csv', help='Testing file') 
     parser.add_argument('--ds_conf', default='./ds_config.json', help='DeepSpeed configuration file') 
-    parser.add_argument('--max_len_gen', type=int, default=32768, help='Max nucleotides per genome') 
-    parser.add_argument('--min_len_gen', type=int, default=-1, help='Max nucleotides per genome') 
-    parser.add_argument('--max_len_mol', type=int, default=2048, help='Max symbols for Canonical SMILES') 
+    parser.add_argument('--max_len_gen', type=int, default=32768, help='Max nucleotides per genome.') 
+    parser.add_argument('--min_len_gen', type=int, default=-1, help='Min nucleotides per genome') 
+    parser.add_argument('--max_len_mol', type=int, default=2048, help='Max symbols for Canonical SMILES.') 
     parser.add_argument('--num_examples_tr', type=int, default=1024, help='Max number of samples TR') 
     parser.add_argument('--num_examples_ts', type=int, default=1024, help='Max number of samples TS') 
     #parser.add_argument('--train_batch_size', type=int,default=8, help='Batch size') 
@@ -372,6 +393,8 @@ def add_argument():
 
     parser.add_argument('--use_encdec_v2', default=False, action='store_true',
                         help='Use the V2 of the EncDec architecture wrapped by Philip Wang (lucidrain on github)')
+    parser.add_argument('--use_full_attn', default=False, action='store_true',
+                        help='Only turn on this flag to override and turn on full attention for all sequence lengths.')
 
     parser = deepspeed.add_config_arguments(parser)
     args=parser.parse_args()
@@ -389,7 +412,9 @@ def main():
     num_examples_ts = cmd_args.num_examples_ts
 
     train_batch_size = json.load(open(cmd_args.ds_conf))['train_batch_size']#cmd_args.train_batch_size
-    zero_optimization = json.load(open(cmd_args.ds_conf))['zero_optimization']
+    gradient_accumulation_steps = json.load(open(cmd_args.ds_conf))['gradient_accumulation_steps']
+    #zero_optimization = json.load(open(cmd_args.ds_conf))['zero_optimization']
+    deepspeed_optimizer = True if json.load(open(cmd_args.ds_conf)).get('optimizer', None) is not None else False
 
     epochs = cmd_args.epochs
     emb_dim = cmd_args.emb_dim
@@ -404,6 +429,7 @@ def main():
     save_every = cmd_args.save_every
     output_folder = cmd_args.output_folder
     use_encdec_v2 = cmd_args.use_encdec_v2
+    use_full_attn = cmd_args.use_full_attn
 
     os.makedirs(output_folder, exist_ok=True)
 
@@ -456,7 +482,10 @@ def main():
             test_dataset=test_dataset,
             validate_every=VALIDATE_EVERY, 
             save_every=SAVE_EVERY,
-            zero_optimization=zero_optimization
+            #zero_optimization=zero_optimization, #unused for now. Use this flag to create IF statement for Zero Compatibility if needed
+            deepspeed_optimizer=deepspeed_optimizer,
+            use_full_attn=use_full_attn,
+            gradient_accumulation_steps=gradient_accumulation_steps
         )
     else:
         train_encdec_v1(
@@ -479,7 +508,10 @@ def main():
             epochs=epochs,
             validate_every=VALIDATE_EVERY, 
             save_every=SAVE_EVERY,
-            zero_optimization=zero_optimization
+            #zero_optimization=zero_optimization, #unused for now. Use this flag to create IF statement for Zero Compatibility if needed
+            deepspeed_optimizer=deepspeed_optimizer,
+            use_full_attn=use_full_attn,
+            gradient_accumulation_steps=gradient_accumulation_steps
         )
 
 
