@@ -9,3 +9,4 @@ saved_model/
 *.pkl
 *.zip
 .DS_Store
+*.log
