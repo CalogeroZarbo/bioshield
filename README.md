@@ -54,15 +54,17 @@ as input. This can be achieved only by using Reformer: The Efficient Transformer
 ### Training the model
 
 After executing the first part of `DataCreation.ipynb` you would have the file `gen_to_mol_tr.csv` and `gen_to_mol_ts.csv` in the root of the project.
-The model is being training using `DeepSpeed` on a workstation with the following specs:
-- 8 vCPU
-- 30GB RAM
-- 2xP100 16GB RAM
 
 The configurations can be found in `ds_config.json` . The trained model has 24 layers in total, 12 for the Encoder and 12 for the Decoder. The hidden layers dimension is 768 neurons, and take advantage of some tricks found in the Reformer Pytorch implementation like `Axial Embeddings` that works well with long sequences, and in order to reduce the memory impact `weight_tie` has been setted to `true` both for the layers weights as well as for the embeddings ones.
 For the same memory reason, the `ff_chunks` and the `attn_chunks` options has been used in order to feed in chunks the data in the model.
 
 The optimizer chosen was the Over9000 implementation of `RangersLars` (more info at https://github.com/mgrankin/over9000). Currently the activation function used is the default one, which is `GLUE`, but in the next training I will use `MISH` (more info at https://github.com/digantamisra98/Mish).
+
+#### First Attempt
+The model is being training using `DeepSpeed` on a workstation with the following specs:
+- 8 vCPU
+- 30GB RAM
+- 2xP100 16GB RAM
 
 This first training has been performed using only the first 50000 samples of the dataset. Full training will be performed on a much more powerful machine with 4x or 8x V100. Since in this initial try we have only 2 GPUs I choose 4 samples for each batch in order to parallelize them in 2 per GPU.
 
@@ -73,6 +75,23 @@ In order to run the training run the following command:
 
 The first 50K trained EncoderDecoder model can be found here:
 - https://storage.googleapis.com/bioshield-bucket/bioshield/first_50k_train.zip
+
+*Outcome:* It seems promising, let's do a more robust training with 8xV100 and 100k samples
+
+#### Second Attempt
+The model is being training using `DeepSpeed` on a workstation with the following specs:
+- 32 vCPU
+- 208 GB RAM
+- 8xV100 16GB RAM
+- Training: 100k samples
+- Test: 1k samples
+- DeepSpeed conf: ds_config_ov9k.json
+- Command to train: `deepspeed train_seq2seq.py --dim 512 --bucket_size 64 --depth 12 --deepspeed --deepspeed_config ds_config_ov9k.json --num_examples_tr 100000 --num_examples_ts 1000 --ff_chunks 200 --attn_chunks 8 --validate_every 10 --save_every 10 --output_folder training_100k-1k_512H_12L_64bck_config_v0.19.5_ov9k_8xV100 --ds_conf ds_config_ov9k.json`
+- Command to test: `python test_seq2seq.py  --num_examples_ts 100 --training_folder ./training_100k-1k_512H_12L_64bck_config_v0.19.5_ov9k_8xV100/ --checkpoint_id 401`
+
+*Outcome:* 
+- No good. The training didn't went well. The model is not learning nothing even thought the loss is decreasing. There is an issue in `reformer_pytorch` repository where this is better explained: https://github.com/lucidrains/reformer-pytorch/issues/69 and https://github.com/lucidrains/reformer-pytorch/issues/75
+- I will try using full attention mechanism, trying to address the memory issue by using a smaller network. It seems that ReformerLM is good for pre-training language models rather than create a full Encoder Decoder architecture.
 
 ### Validating the model
 
@@ -112,4 +131,9 @@ MISH:
 
 Refomer:
 - https://github.com/lucidrains/reformer-pytorch
+
+
+******
+If this repo has been useful for your researches, please cite it :) It will be much appriciated.
+Cal
 
