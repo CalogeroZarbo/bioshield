@@ -241,21 +241,10 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
             training_data=train_dataset
             )
         
-        testloader = enc_dec_engine.deepspeed_io(test_dataset)
-
-        # enc_dec_engine, enc_dec_optimizer, testloader, _ = deepspeed.initialize(
-        #     args=cmd_args, 
-        #     model=enc_dec, 
-        #     optimizer=enc_dec_optimizer, 
-        #     model_parameters=enc_dec_params, 
-        #     training_data=test_dataset
-        #     )
-        #_, _, testloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, optimizer=enc_dec_optimizer, training_data=test_dataset)
     else:
         print('Found optimizer in the DeepSpeed configurations. Using it.')
         enc_dec_engine, enc_dec_optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, model_parameters=enc_dec_params, training_data=train_dataset)
-        enc_dec_engine, enc_dec_optimizer, testloader, _ = deepspeed.initialize(args=cmd_args, model=enc_dec, model_parameters=enc_dec_params, training_data=test_dataset)
-    
+        
     # training
     SAVE_DIR = os.sep.join([output_folder, 'saved_model'])
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -273,7 +262,7 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
     log_file.write("\n\n\n{}\tStarting new training from chekpoint: EncoderDecoder-{}\n".format(datetime.datetime.now(), enc_dec_ckp_max))
     log_file.flush()
 
-    #testloader = DataLoader(dataset=test_dataset, batch_size=gpus_mini_batch, shuffle=True)
+    testloader = enc_dec_engine.deepspeed_io(test_dataset)
 
     for eph in range(epochs):
         print('Starting Epoch: {}'.format(eph))
@@ -284,7 +273,7 @@ def train_encdec_v2(input_lang, target_lang, dim, bucket_size, vir_seq_len, dept
             trg = pair[1]
 
             enc_dec_engine.train()
-            enc_dec.train()
+            #enc_dec.train()
             
             src = src.to(enc_dec_engine.local_rank)
             trg = trg.to(enc_dec_engine.local_rank)
