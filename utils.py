@@ -8,6 +8,7 @@ import os
 PAD_IDX = 0
 SOS_token = 1
 EOS_token = 2
+SEP_token = 3
 
 def compute_axial_position_shape(seq_len):
     import math
@@ -40,10 +41,10 @@ def compute_axial_position_shape(seq_len):
 class Lang:
     def __init__(self, name):
         self.name = name
-        self.word2index = {}
-        self.word2count = {}
-        self.index2word = {PAD_IDX: "PAD", SOS_token: "SOS", EOS_token: "EOS"}
-        self.n_words = 3  # Count PAD, SOS and EOS
+        self.word2index = {"PAD": PAD_IDX, "SOS": SOS_token, "EOS": EOS_token, "SEP": SEP_token}
+        self.word2count = {"PAD": 0, "SOS": 0, "EOS": 0, "SEP": 0}
+        self.index2word = {PAD_IDX: "PAD", SOS_token: "SOS", EOS_token: "EOS", SEP_token: "SEP"}
+        self.n_words = 4  # Count PAD, SOS and EOS
         self.max_len = 0
 
     def addSentence(self, sentence):
@@ -68,6 +69,22 @@ def preprocess_sentence(code, max_len):
     seq.append("EOS")
     while len(seq) < max_len:
         seq.append("PAD")
+    return " ".join(seq)
+
+def preprocess_chemicals(chem1, chem2, max_len):
+    seq = []
+
+    for char in chem1:
+        seq.append(char)
+
+    seq.append("SEP")
+
+    for char in chem2:
+        seq.append(char)
+
+    while len(seq) < max_len:
+        seq.append("PAD")
+
     return " ".join(seq)
 
 def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts,max_len_genome,min_len_genome,max_len_molecule,reverse=False, saved_input_lang=None, saved_target_lang=None):
@@ -194,6 +211,125 @@ def readGenomes(genome_file_tr, genome_file_ts, num_examples_tr, num_examples_ts
 
     return input_lang, output_lang, tr_pairs, ts_pairs
 
+def readMolecules(molecule_file_tr, molecule_file_ts, num_examples_tr, num_examples_ts,min_len_molecule,max_len_molecule,reverse=False, saved_molecule_lang=None):
+    print("Reading lines...")
+    lang1 = "Molecule SMILES"
+
+    tr_samples = []
+    # Read the file and split into lines
+    with open(molecule_file_tr) as csv_file:
+        csv_reader = csv.reader(csv_file, delimiter=",", quoting=csv.QUOTE_MINIMAL)
+        header = None
+        for i,row in tqdm(enumerate(csv_reader)):
+            if header is None:
+                header = row
+                continue
+            if num_examples_tr > 0:
+                if len(tr_samples) == num_examples_tr:
+                    break
+            
+            chem1 = row[header.index('chem1')]
+            chem2 = row[header.index('chem2')]
+            equal = row[header.index('equal')]
+
+            if max_len_molecule > 0:
+                if len(chem1) > max_len_molecule or len(chem2) > max_len_molecule:
+                    continue
+
+            if min_len_molecule > 0:
+                if len(chem1) < min_len_molecule or len(chem2) < min_len_molecule:
+                    continue
+
+            if max_len_molecule > 0:
+                if len(chem1) <= max_len_mol-2  and len(chem2) <= max_len_mol-2:# -2 is for SOS and EOS
+                    # Split line into pairs and normalize
+                    tr_samples.append([preprocess_chemicals(chem1, chem2, max_len_mol), equal])
+            else:
+                tr_samples.append([preprocess_chemicals(chem1, chem2, max_len_mol), equal])
+    
+    ts_samples = []
+    # Read the file and split into lines
+    with open(molecule_file_ts) as csv_file:
+        csv_reader = csv.reader(csv_file, delimiter=",", quoting=csv.QUOTE_MINIMAL)
+        header = None
+        for i,row in tqdm(enumerate(csv_reader)):
+            if header is None:
+                header = row
+                continue
+            if num_examples_ts > 0:
+                if len(ts_samples) == num_examples_ts:
+                    break
+            chem1 = row[header.index('chem1')]
+            chem2 = row[header.index('chem2')]
+            equal = row[header.index('equal')]
+
+            if max_len_molecule > 0:
+                if len(chem1) > max_len_molecule or len(chem2) > max_len_molecule:
+                    continue
+
+            if min_len_molecule > 0:
+                if len(chem1) < min_len_molecule or len(chem2) < min_len_molecule:
+                    continue
+
+            if max_len_molecule > 0:
+                if len(chem1) <= max_len_mol-2  and len(chem2) <= max_len_mol-2:# -2 is for SOS and EOS
+                    # Split line into pairs and normalize
+                    ts_samples.append([preprocess_chemicals(chem1, chem2, max_len_mol), equal])
+            else:
+                ts_samples.append([preprocess_chemicals(chem1, chem2, max_len_mol), equal])
+    # Reverse pairs, make Lang instances
+    if reverse:
+        tr_samples = [list(reversed(p)) for p in tr_samples]
+        ts_samples = [list(reversed(p)) for p in ts_samples]
+    print("Read %s molecule pairs training" % len(tr_samples))
+    print("Trimmed to %s molecule pairs training" % len(tr_samples))
+    print("Read %s molecule pairs test" % len(ts_samples))
+    print("Trimmed to %s molecule pairs test" % len(ts_samples))
+    print("Counting words...")
+    max_len_mol = 0
+    for pair in tr_samples:
+        mol_pair = pair[0].split(' ')
+        if len(mol_pair) > max_len_mol:
+            max_len_mol = len(mol_pair)
+
+    for pair in ts_samples:
+        mol_pair = pair[0].split(' ')
+        if len(mol_pair) > max_len_mol:
+            max_len_mol = len(mol_pair)
+
+    for i,pair in enumerate(tr_samples):
+        mol_pair = pair[0].split(' ')   
+        while len(mol_pair) < max_len_mol:
+            mol_pair.append("PAD")
+        tr_samples[i][0] = ' '.join(mol_pair)
+    
+    for i,pair in enumerate(ts_samples):
+        mol_pair = pair[0].split(' ')   
+        while len(mol_pair) < max_len_mol:
+            mol_pair.append("PAD")
+        ts_samples[i][0] = ' '.join(mol_pair)
+
+    if os.path.exists(saved_molecule_lang):
+        print('Loading saved vocab.')
+        molecule_lang = pickle.load(open(saved_molecule_lang, 'rb'))
+        print('Molecule tokens', molecule_lang.n_words)
+    else:
+        molecule_lang = Lang(lang1)
+
+    for pair in tr_samples:
+        molecule_lang.addSentence(pair[0])
+
+    for pair in ts_samples:
+        molecule_lang.addSentence(pair[0])    
+
+    print("Counted words:")
+    print(molecule_lang.name, molecule_lang.n_words)
+    print("Max Len:")
+    print(molecule_lang.name, molecule_lang.max_len)
+    print("Output MaxLen measured:", max_len_mol)
+
+    return molecule_lang, tr_samples, ts_samples
+
 def indexesFromSentence(lang, sentence):
     return [lang.word2index[word] for word in sentence.split(' ')]
 
@@ -209,6 +345,22 @@ class GenomeToMolDataset(Dataset):
         pair = self.data[index]
         src = torch.tensor(indexesFromSentence(self.src_lang,pair[0]), dtype=torch.long)
         trg = torch.tensor(indexesFromSentence(self.trg_lang,pair[1]), dtype=torch.long)
+        return src,trg
+
+    def __len__(self):
+        return int(len(self.data) / self.segmentation)
+
+class MolecularSimilarityDataset(Dataset):
+    def __init__(self, data, src_lang, segmentation=1):
+        super().__init__()
+        self.data = data
+        self.src_lang = src_lang
+        self.segmentation = segmentation
+
+    def __getitem__(self, index):
+        pair = self.data[index]
+        src = torch.tensor(indexesFromSentence(self.src_lang,pair[0]), dtype=torch.long)
+        trg = torch.tensor(self.trg_lang,pair[1], dtype=torch.long)
         return src,trg
 
     def __len__(self):
