@@ -8,3 +8,4 @@ tqdm
 sklearn
 cufflinks
 plotly
+transformers

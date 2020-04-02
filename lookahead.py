@@ -1,5 +1,4 @@
 # Lookahead implementation from https://github.com/rwightman/pytorch-image-models/blob/master/timm/optim/lookahead.py
-
 """ Lookahead Optimizer Wrapper.
 Implementation modified from: https://github.com/alphadl/lookahead.pytorch
 Paper: `Lookahead Optimizer: k steps forward, 1 step back` - https://arxiv.org/abs/1907.08610
@@ -7,6 +6,7 @@ Paper: `Lookahead Optimizer: k steps forward, 1 step back` - https://arxiv.org/a
 import torch
 from torch.optim.optimizer import Optimizer
 from collections import defaultdict
+
 
 class Lookahead(Optimizer):
     def __init__(self, base_optimizer, alpha=0.5, k=6):
@@ -53,10 +53,8 @@ class Lookahead(Optimizer):
 
     def state_dict(self):
         fast_state_dict = self.base_optimizer.state_dict()
-        slow_state = {
-            (id(k) if isinstance(k, torch.Tensor) else k): v
-            for k, v in self.state.items()
-        }
+        slow_state = {(id(k) if isinstance(k, torch.Tensor) else k): v
+                      for k, v in self.state.items()}
         fast_state = fast_state_dict['state']
         param_groups = fast_state_dict['param_groups']
         return {
@@ -76,12 +74,14 @@ class Lookahead(Optimizer):
         # with base_optimizer. This is a bit redundant but least code
         slow_state_new = False
         if 'slow_state' not in state_dict:
-            print('Loading state_dict from optimizer without Lookahead applied.')
+            print(
+                'Loading state_dict from optimizer without Lookahead applied.')
             state_dict['slow_state'] = defaultdict(dict)
             slow_state_new = True
         slow_state_dict = {
             'state': state_dict['slow_state'],
-            'param_groups': state_dict['param_groups'],  # this is pointless but saves code
+            'param_groups':
+            state_dict['param_groups'],  # this is pointless but saves code
         }
         super(Lookahead, self).load_state_dict(slow_state_dict)
         self.param_groups = self.base_optimizer.param_groups  # make both ref same container
@@ -91,6 +91,7 @@ class Lookahead(Optimizer):
                 for group in self.param_groups:
                     group.setdefault(name, default)
 
+
 def LookaheadAdam(params, alpha=0.5, k=6, *args, **kwargs):
-     adam = Adam(params, *args, **kwargs)
-     return Lookahead(adam, alpha, k)
+    adam = Adam(params, *args, **kwargs)
+    return Lookahead(adam, alpha, k)

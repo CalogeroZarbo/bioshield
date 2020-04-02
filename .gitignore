@@ -13,3 +13,4 @@ saved_model/
 first_50k_train/
 training_100k-1k_512H_12L_64bck_config_v0.19.6_ov9k_8xV100/
 data/
+STS-Benchmark/
